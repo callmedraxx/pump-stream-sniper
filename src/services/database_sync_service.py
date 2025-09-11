@@ -1,0 +1,499 @@
+import asyncio
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Any, Dict, List, Set
+
+from sqlalchemy import and_, desc, or_
+from sqlalchemy.orm import Session
+
+from ..models import Token
+from ..services.fetch_activities import fetch_market_activities
+# TEMPORARILY DISABLED: from ..services.fetch_top_holders import TopHoldersService
+from ..services.token_service import TokenService
+
+logger = logging.getLogger(__name__)
+
+
+class DatabaseSyncService:
+    """
+    High-performance database synchronization service for pump.fun tokens
+    Handles parallel processing, real-time updates, and data consistency
+    """
+
+    def __init__(self, db: Session, max_workers: int = 20):
+        self.db = db
+        self.token_service = TokenService(db)
+        # TEMPORARILY DISABLED: self.holders_service = TopHoldersService(
+        #     db, max_concurrent=max_workers // 2
+        # )  # Use half the workers for holders
+        self.max_workers = max_workers
+        self.executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="token_sync"
+        )
+
+    async def sync_live_tokens(
+        self, live_tokens_data: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Synchronize live tokens data with database in parallel
+
+        Args:
+            live_tokens_data: List of token data from fetch_live
+
+        Returns:
+            Sync statistics
+        """
+        start_time = time.time()
+
+        logger.info(f"Starting sync with {len(live_tokens_data)} tokens using {self.max_workers} workers")
+
+        # Extract mint addresses from live data
+        live_mint_addresses = {
+            token.get("mint") for token in live_tokens_data if token.get("mint")
+        }
+
+        # Get existing tokens from database
+        existing_tokens = self.token_service.get_all_tokens(
+            limit=10000
+        )  # Get all for comparison
+        existing_mint_addresses = {token.mint_address for token in existing_tokens}
+
+        # Calculate differences
+        new_mints = live_mint_addresses - existing_mint_addresses
+        removed_mints = existing_mint_addresses - live_mint_addresses
+        updated_mints = live_mint_addresses & existing_mint_addresses
+
+        logger.info(
+            f"Sync stats: {len(new_mints)} new, {len(removed_mints)} removed, {len(updated_mints)} updated"
+        )
+
+        # Process in parallel
+        tasks = []
+
+        # Add new tokens
+        if new_mints:
+            new_tokens_data = [
+                token for token in live_tokens_data if token.get("mint") in new_mints
+            ]
+            tasks.append(self._add_new_tokens_parallel(new_tokens_data))
+
+        # Update existing tokens
+        if updated_mints:
+            existing_tokens_dict = {
+                token.mint_address: token for token in existing_tokens
+            }
+            updated_tokens_data = [
+                token
+                for token in live_tokens_data
+                if token.get("mint") in updated_mints
+            ]
+            tasks.append(
+                self._update_existing_tokens_parallel(
+                    updated_tokens_data, existing_tokens_dict
+                )
+            )
+
+        # Remove old tokens
+        if removed_mints:
+            tasks.append(self._remove_old_tokens_parallel(list(removed_mints)))
+
+        # Execute all tasks concurrently
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # TEMPORARILY DISABLED: Update holders data for all live tokens (run in background)
+        # if live_mint_addresses:
+        #     # Don't await this - let it run in background for better performance
+        #     asyncio.create_task(
+        #         self.update_holders_for_tokens(list(live_mint_addresses))
+        #     )
+
+        sync_time = time.time() - start_time
+        stats = {
+            "sync_time_seconds": round(sync_time, 2),
+            "new_tokens": len(new_mints),
+            "removed_tokens": len(removed_mints),
+            "updated_tokens": len(updated_mints),
+            "total_live_tokens": len(live_tokens_data),
+            "tokens_per_second": (
+                round(len(live_tokens_data) / sync_time, 2) if sync_time > 0 else 0
+            ),
+        }
+
+        logger.info(
+            f"Sync completed in {stats['sync_time_seconds']}s - {stats['tokens_per_second']} tokens/sec"
+        )
+        return stats
+
+    async def _add_new_tokens_parallel(self, new_tokens_data: List[Dict[str, Any]]):
+        """Add new tokens with market activities in parallel"""
+        logger.info(f"Adding {len(new_tokens_data)} new tokens")
+
+        # Execute in parallel with semaphore to control concurrency
+        semaphore = asyncio.Semaphore(self.max_workers)
+
+        async def limited_task(token_data):
+            async with semaphore:
+                return await self._create_token_with_activities(token_data)
+
+        limited_tasks = [
+            limited_task(token_data)
+            for token_data in new_tokens_data
+        ]
+        await asyncio.gather(*limited_tasks, return_exceptions=True)
+
+    async def _create_token_with_activities(self, token_data: Dict[str, Any]):
+        """Create a single token with market activities"""
+        try:
+            # Debug: Check token_data structure
+            if not isinstance(token_data, dict):
+                logger.error(f"Invalid token_data type: {type(token_data)}, value: {token_data}")
+                return
+
+            pool_address = token_data.get("pump_swap_pool")
+            if pool_address is None or pool_address == "":
+                logger.debug(f"Token {token_data.get('mint')} has null/empty pump_swap_pool - will skip market activities")
+                pool_address = ""  # Use empty string instead of None
+
+            # Fetch market activities only if pump_swap_pool is valid
+            market_activities = {}
+            if pool_address and pool_address.strip():
+                try:
+                    result = await fetch_market_activities(pool_address)
+                    market_activities = result if isinstance(result, dict) else {}
+                    logger.debug(f"Fetched market activities for {token_data.get('symbol')}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch market activities for {token_data.get('mint')}: {e}")
+                    market_activities = {}  # Use empty dict as fallback
+            else:
+                logger.debug(f"Skipping market activities fetch for {token_data.get('symbol')} - invalid pump_swap_pool")
+
+            # Ensure market_activities is always a dict
+            if not isinstance(market_activities, dict):
+                logger.warning(f"market_activities is not a dict, got {type(market_activities)} - using empty dict")
+                market_activities = {}
+
+            # Create token data with activities
+            token_dict = self._prepare_token_data(token_data, market_activities)
+
+            # Create token in database
+            self.token_service.create_token(token_dict)
+            logger.debug(f"Created token: {token_data.get('symbol')}")
+
+        except Exception as e:
+            logger.error(f"Error creating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")
+
+    async def _update_existing_tokens_parallel(
+        self,
+        updated_tokens_data: List[Dict[str, Any]],
+        existing_tokens_dict: Dict[str, Token],
+    ):
+        """Update existing tokens with latest data in parallel"""
+        logger.info(f"Updating {len(updated_tokens_data)} existing tokens")
+
+        # Execute in parallel with semaphore
+        semaphore = asyncio.Semaphore(self.max_workers)
+
+        async def limited_task(token_data):
+            if token_data is None:
+                logger.error("Received None for token_data, skipping this task.")
+                return
+
+            #logger.info(f"Processing token_data: {token_data}")
+            existing_token = existing_tokens_dict.get(token_data.get("mint"))
+            if existing_token:
+                logger.info(f"Found existing token for mint {token_data.get('mint')}: {existing_token}")
+                return await self._update_token_with_activities(token_data, existing_token)
+            else:
+                logger.warning(f"No existing token found for mint {token_data.get('mint')}")
+
+        limited_tasks = [
+            limited_task(token_data)
+            for token_data in updated_tokens_data
+        ]
+        await asyncio.gather(*limited_tasks, return_exceptions=True)
+
+    async def _update_token_with_activities(
+        self, token_data: Dict[str, Any], existing_token: Token
+    ):
+        """Update a single token with latest market activities"""
+        try:
+            # Debug: Check token_data structure
+            if not isinstance(token_data, dict):
+                logger.error(f"Invalid token_data type: {type(token_data)}, value: {token_data}")
+                return
+
+            #logger.info(f": {token_data}")
+
+            pool_address = token_data.get("pump_swap_pool")
+            if pool_address is None or pool_address == "":
+                logger.debug(f"Token {token_data.get('mint')} has null/empty pump_swap_pool - will skip market activities")
+                pool_address = ""  # Use empty string instead of None
+
+            # Fetch market activities only if pump_swap_pool is valid
+            market_activities = {}
+            if pool_address and pool_address.strip():
+                try:
+                    logger.info(f"Fetching market activities for pool_address: {pool_address}")
+                    result = await fetch_market_activities(pool_address)
+                    market_activities = result if isinstance(result, dict) else {}
+                    #logger.info(f"Fetched market activities: {market_activities}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch market activities for {token_data.get('mint')}: {e}")
+                    market_activities = {}  # Use empty dict as fallback
+            else:
+                logger.debug(f"Skipping market activities fetch for {token_data.get('symbol')} - invalid pump_swap_pool")
+
+            # Ensure market_activities is always a dict
+            if not isinstance(market_activities, dict):
+                logger.warning(f"market_activities is not a dict, got {type(market_activities)} - using empty dict")
+                market_activities = {}
+
+            # Prepare update data
+            update_data = self._prepare_update_data(token_data, market_activities)
+            #logger.info(f"Prepared update_data: {update_data}")
+
+            # Check if any fields actually changed
+            if self._has_changes(existing_token, update_data):
+                # Update token in database
+                self.token_service.update_token(token_data.get("mint"), update_data)
+                logger.info(f"Updated token: {token_data.get('symbol')}")
+            else:
+                logger.debug(f"No changes for token: {token_data.get('symbol')}")
+
+        except Exception as e:
+            logger.error(f"Error updating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")
+
+    async def _remove_old_tokens_parallel(self, removed_mints: List[str]):
+        """Remove tokens that are no longer live"""
+        logger.info(f"Removing {len(removed_mints)} old tokens")
+
+        for mint in removed_mints:
+            try:
+                self.token_service.delete_token(mint)
+                logger.debug(f"Removed token: {mint}")
+            except Exception as e:
+                logger.error(f"Error removing token {mint}: {e}")
+
+    def _prepare_token_data(
+        self, token_data: Dict[str, Any], market_activities: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """Prepare token data for database insertion"""
+        # Calculate progress
+        mcap = token_data.get("usd_market_cap", token_data.get("market_cap", 0)) or 0
+        ath = token_data.get("ath_market_cap", mcap) or mcap
+        progress = (mcap / ath * 100) if ath > 0 else 0
+
+        # Calculate age
+        created_ts = token_data.get("created_timestamp", 0) or 0
+        age = datetime.fromtimestamp(created_ts / 1000) if created_ts > 0 else datetime.now()
+
+        # Extract market activity data
+        activities_5m = (market_activities.get("5m") or {}) if market_activities and isinstance(market_activities, dict) else {}
+        activities_1h = (market_activities.get("1h") or {}) if market_activities and isinstance(market_activities, dict) else {}
+        activities_6h = (market_activities.get("6h") or {}) if market_activities and isinstance(market_activities, dict) else {}
+        activities_24h = (market_activities.get("24h") or {}) if market_activities and isinstance(market_activities, dict) else {}
+
+        return {
+            # Core information (static fields) - handle nulls
+            "mint_address": token_data.get("mint", ""),
+            "name": token_data.get("name", ""),
+            "symbol": token_data.get("symbol", ""),
+            "image_url": token_data.get("image_uri", ""),
+            "stream_url": f"https://pump.fun/coin/{token_data.get('mint', '')}",
+            "creator": token_data.get("creator", ""),
+            "total_supply": token_data.get("total_supply", 0) or 0,
+            "pump_swap_pool": token_data.get("pump_swap_pool", ""),
+            # Social links (static)
+            "twitter": token_data.get("twitter"),
+            "telegram": token_data.get("telegram"),
+            "website": token_data.get("website"),
+            # Dynamic fields (updated frequently) - handle nulls
+            "age": age,
+            "mcap": mcap,
+            "ath": ath,
+            "progress": progress,
+            "viewers": token_data.get("num_participants", 0) or 0,
+            "liquidity": token_data.get("virtual_sol_reserves", 0) or 0,
+            # Price changes - defaults to 0
+            "price_change_5m": activities_5m.get("priceChangePercent", 0) or 0,
+            "price_change_1h": activities_1h.get("priceChangePercent", 0) or 0,
+            "price_change_6h": activities_6h.get("priceChangePercent", 0) or 0,
+            "price_change_24h": activities_24h.get("priceChangePercent", 0) or 0,
+            # Trader counts - defaults to 0
+            "traders_5m": activities_5m.get("numUsers", 0) or 0,
+            "traders_1h": activities_1h.get("numUsers", 0) or 0,
+            "traders_6h": activities_6h.get("numUsers", 0) or 0,
+            "traders_24h": activities_24h.get("numUsers", 0) or 0,
+            # Volume data - defaults to 0
+            "volume_5m": activities_5m.get("volumeUSD", 0) or 0,
+            "volume_1h": activities_1h.get("volumeUSD", 0) or 0,
+            "volume_6h": activities_6h.get("volumeUSD", 0) or 0,
+            "volume_24h": activities_24h.get("volumeUSD", 0) or 0,
+            # Transaction counts - defaults to 0
+            "txns_5m": activities_5m.get("numTxs", 0) or 0,
+            "txns_1h": activities_1h.get("numTxs", 0) or 0,
+            "txns_6h": activities_6h.get("numTxs", 0) or 0,
+            "txns_24h": activities_24h.get("numTxs", 0) or 0,
+            # Status flags - handle nulls
+            "is_live": token_data.get("is_currently_live", False) or False,
+            "nsfw": token_data.get("nsfw", False) or False,
+            # Optional fields
+            "raydium_pool": token_data.get("raydium_pool"),
+            "description": token_data.get("description"),
+            "metadata_uri": token_data.get("metadata_uri"),
+            "video_uri": token_data.get("video_uri"),
+            "banner_uri": token_data.get("banner_uri"),
+            # Bonding curve data - handle nulls
+            "virtual_sol_reserves": token_data.get("virtual_sol_reserves"),
+            "real_sol_reserves": token_data.get("real_sol_reserves"),
+            "virtual_token_reserves": token_data.get("virtual_token_reserves"),
+            "real_token_reserves": token_data.get("real_token_reserves"),
+            "complete": token_data.get("complete"),
+            # Activity metrics - handle nulls
+            "reply_count": token_data.get("reply_count", 0) or 0,
+            "last_reply": (
+                datetime.fromtimestamp(token_data.get("last_reply", 0) / 1000)
+                if token_data.get("last_reply")
+                else None
+            ),
+            "last_trade_timestamp": (
+                datetime.fromtimestamp(token_data.get("last_trade_timestamp", 0) / 1000)
+                if token_data.get("last_trade_timestamp")
+                else None
+            ),
+            # Raw data backup
+            "raw_data": token_data,
+        }
+
+    def _prepare_update_data(
+        self, token_data: Dict[str, Any], market_activities: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """Prepare update data for existing tokens (only dynamic fields)"""
+        # Calculate progress
+        mcap = token_data.get("usd_market_cap", token_data.get("market_cap", 0)) or 0
+        ath = token_data.get("ath_market_cap", mcap) or mcap
+        progress = (mcap / ath * 100) if ath > 0 else 0
+
+        # Extract market activity data
+        activities_5m = (market_activities.get("5m") or {}) if market_activities and isinstance(market_activities, dict) else {}
+        activities_1h = (market_activities.get("1h") or {}) if market_activities and isinstance(market_activities, dict) else {}
+        activities_6h = (market_activities.get("6h") or {}) if market_activities and isinstance(market_activities, dict) else {}
+        activities_24h = (market_activities.get("24h") or {}) if market_activities and isinstance(market_activities, dict) else {}
+
+        return {
+            # Dynamic fields only (static fields don't change)
+            "mcap": mcap,
+            "ath": ath,
+            "progress": progress,
+            "viewers": token_data.get("num_participants", 0) or 0,
+            "liquidity": token_data.get("virtual_sol_reserves", 0) or 0,
+            # Price changes - defaults to 0
+            "price_change_5m": activities_5m.get("priceChangePercent", 0) or 0,
+            "price_change_1h": activities_1h.get("priceChangePercent", 0) or 0,
+            "price_change_6h": activities_6h.get("priceChangePercent", 0) or 0,
+            "price_change_24h": activities_24h.get("priceChangePercent", 0) or 0,
+            # Trader counts - defaults to 0
+            "traders_5m": activities_5m.get("numUsers", 0) or 0,
+            "traders_1h": activities_1h.get("numUsers", 0) or 0,
+            "traders_6h": activities_6h.get("numUsers", 0) or 0,
+            "traders_24h": activities_24h.get("numUsers", 0) or 0,
+            # Volume data - defaults to 0
+            "volume_5m": activities_5m.get("volumeUSD", 0) or 0,
+            "volume_1h": activities_1h.get("volumeUSD", 0) or 0,
+            "volume_6h": activities_6h.get("volumeUSD", 0) or 0,
+            "volume_24h": activities_24h.get("volumeUSD", 0) or 0,
+            # Transaction counts - defaults to 0
+            "txns_5m": activities_5m.get("numTxs", 0) or 0,
+            "txns_1h": activities_1h.get("numTxs", 0) or 0,
+            "txns_6h": activities_6h.get("numTxs", 0) or 0,
+            "txns_24h": activities_24h.get("numTxs", 0) or 0,
+            # Status flags - handle nulls
+            "is_live": token_data.get("is_currently_live", False) or False,
+            # Activity metrics - handle nulls
+            "reply_count": token_data.get("reply_count", 0) or 0,
+            "last_reply": (
+                datetime.fromtimestamp(token_data.get("last_reply", 0) / 1000)
+                if token_data.get("last_reply")
+                else None
+            ),
+            "last_trade_timestamp": (
+                datetime.fromtimestamp(token_data.get("last_trade_timestamp", 0) / 1000)
+                if token_data.get("last_trade_timestamp")
+                else None
+            ),
+            # Bonding curve data - handle nulls
+            "virtual_sol_reserves": token_data.get("virtual_sol_reserves"),
+            "real_sol_reserves": token_data.get("real_sol_reserves"),
+            "virtual_token_reserves": token_data.get("virtual_token_reserves"),
+            "real_token_reserves": token_data.get("real_token_reserves"),
+            "complete": token_data.get("complete"),
+            # Raw data backup
+            "raw_data": token_data,
+        }
+
+    def _has_changes(self, existing_token: Token, update_data: Dict[str, Any]) -> bool:
+        """Check if any fields have actually changed"""
+        # Check dynamic fields for changes
+        dynamic_fields = [
+            "mcap",
+            "ath",
+            "progress",
+            "viewers",
+            "liquidity",
+            "price_change_5m",
+            "price_change_1h",
+            "price_change_6h",
+            "price_change_24h",
+            "traders_5m",
+            "traders_1h",
+            "traders_6h",
+            "traders_24h",
+            "volume_5m",
+            "volume_1h",
+            "volume_6h",
+            "volume_24h",
+            "txns_5m",
+            "txns_1h",
+            "txns_6h",
+            "txns_24h",
+            "is_live",
+            "reply_count",
+            "last_reply",
+            "last_trade_timestamp",
+            "virtual_sol_reserves",
+            "real_sol_reserves",
+            "complete",
+        ]
+
+        for field in dynamic_fields:
+            if field in update_data:
+                current_value = getattr(existing_token, field)
+                new_value = update_data[field]
+
+                # Handle None comparisons
+                if current_value != new_value:
+                    if not (current_value is None and new_value == 0):
+                        if not (current_value == 0 and new_value is None):
+                            return True
+
+        return False
+
+    # TEMPORARILY DISABLED: async def update_holders_for_tokens(
+    #     self, mint_addresses: List[str]
+    # ) -> Dict[str, bool]:
+    #     """
+    #     Update holders data for specified tokens
+    #     """
+    #     if not mint_addresses:
+    #         return {}
+
+    #     logger.info(f"Updating holders for {len(mint_addresses)} tokens")
+    #     return await self.holders_service.update_multiple_tokens_holders(mint_addresses)
+
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.executor:
+            self.executor.shutdown(wait=True)

@@ -1,0 +1,50 @@
+{
+  "5m": {
+    "numTxs": 3,
+    "volumeUSD": 1598.5129980561571,
+    "numUsers": 3,
+    "numBuys": 1,
+    "numSells": 2,
+    "buyVolumeUSD": 1090.2767789535458,
+    "sellVolumeUSD": 508.23621910261136,
+    "numBuyers": 1,
+    "numSellers": 2,
+    "priceChangePercent": -0.17002567537559543
+  },
+  "1h": {
+    "numTxs": 18,
+    "volumeUSD": 5764.1892213379515,
+    "numUsers": 14,
+    "numBuys": 8,
+    "numSells": 10,
+    "buyVolumeUSD": 1717.5444059442739,
+    "sellVolumeUSD": 4046.644815393678,
+    "numBuyers": 6,
+    "numSellers": 10,
+    "priceChangePercent": -1.2928948498552266
+  },
+  "6h": {
+    "numTxs": 191,
+    "volumeUSD": 91602.77109547413,
+    "numUsers": 102,
+    "numBuys": 90,
+    "numSells": 101,
+    "buyVolumeUSD": 43144.09131545859,
+    "sellVolumeUSD": 48458.67978001555,
+    "numBuyers": 61,
+    "numSellers": 57,
+    "priceChangePercent": -1.4710948115948754
+  },
+  "24h": {
+    "numTxs": 755,
+    "volumeUSD": 314928.22323068,
+    "numUsers": 294,
+    "numBuys": 449,
+    "numSells": 306,
+    "buyVolumeUSD": 150724.67696677375,
+    "sellVolumeUSD": 164203.54626390626,
+    "numBuyers": 186,
+    "numSellers": 159,
+    "priceChangePercent": -5.060961993366196
+  }
+}
