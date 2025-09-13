@@ -39,7 +39,7 @@ class TokenService:
             self.db.add(token)
             self.db.commit()
             self.db.refresh(token)
-            logger.info(f"Created token: {token.symbol} ({token.mint_address[:8]}...)")
+            #logger.info(f"Created token: {token.symbol} ({token.mint_address[:8]}...)")
             return token
 
         except Exception as e:
@@ -74,7 +74,7 @@ class TokenService:
             token.updated_at = datetime.now()
             self.db.commit()
             self.db.refresh(token)
-            logger.info(f"Updated token: {token.symbol}")
+            #logger.info(f"Updated token: {token.symbol}")
             return token
 
         except Exception as e:
@@ -296,7 +296,7 @@ class TokenService:
 
             self.db.delete(token)
             self.db.commit()
-            logger.info(f"Deleted token: {mint_address}")
+            #logger.info(f"Deleted token: {mint_address}")
             return True
 
         except Exception as e:

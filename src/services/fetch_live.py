@@ -57,7 +57,7 @@ async def poll_live_tokens():
         "Priority": "u=1, i",
     }
 
-    poll_interval = 5  # Poll every 5 seconds as requested
+    poll_interval = 2  # Poll every 2 seconds as requested
     last_data_hash = None
 
     async with aiohttp.ClientSession() as session:
@@ -120,6 +120,10 @@ async def poll_live_tokens():
                             )
                         else:
                             print(f"✅ No changes in live tokens data")
+                    elif response.status == 429:
+                        print(f"⚠️ Rate limited (429)! Pausing polling for 40 seconds...")
+                        await asyncio.sleep(40)
+                        continue  # Skip the normal sleep interval and retry immediately
                     else:
                         print(
                             f"❌ Failed to fetch live tokens, status: {response.status}"

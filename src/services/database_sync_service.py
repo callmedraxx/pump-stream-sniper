@@ -180,7 +180,7 @@ class DatabaseSyncService:
 
             # Create token in database
             self.token_service.create_token(token_dict)
-            logger.debug(f"Created token: {token_data.get('symbol')}")
+            #logger.debug(f"Created token: {token_data.get('symbol')}")
 
         except Exception as e:
             logger.error(f"Error creating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")
@@ -204,7 +204,7 @@ class DatabaseSyncService:
             #logger.info(f"Processing token_data: {token_data}")
             existing_token = existing_tokens_dict.get(token_data.get("mint"))
             if existing_token:
-                logger.info(f"Found existing token for mint {token_data.get('mint')}: {existing_token}")
+                #logger.info(f"Found existing token for mint {token_data.get('mint')}: {existing_token}")
                 return await self._update_token_with_activities(token_data, existing_token)
             else:
                 logger.warning(f"No existing token found for mint {token_data.get('mint')}")
@@ -236,9 +236,10 @@ class DatabaseSyncService:
             market_activities = {}
             if pool_address and pool_address.strip():
                 try:
-                    logger.info(f"Fetching market activities for pool_address: {pool_address}")
+                    #logger.info(f"Fetching market activities for pool_address: {pool_address}")
                     result = await fetch_market_activities(pool_address)
                     market_activities = result if isinstance(result, dict) else {}
+
                     #logger.info(f"Fetched market activities: {market_activities}")
                 except Exception as e:
                     logger.warning(f"Failed to fetch market activities for {token_data.get('mint')}: {e}")
@@ -259,7 +260,7 @@ class DatabaseSyncService:
             if self._has_changes(existing_token, update_data):
                 # Update token in database
                 self.token_service.update_token(token_data.get("mint"), update_data)
-                logger.info(f"Updated token: {token_data.get('symbol')}")
+                #logger.info(f"Updated token: {token_data.get('symbol')}")
             else:
                 logger.debug(f"No changes for token: {token_data.get('symbol')}")
 

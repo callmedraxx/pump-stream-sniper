@@ -515,29 +515,41 @@ async def stream_tokens(
                                     "mint_address": t.mint_address,
                                     "name": t.name,
                                     "symbol": t.symbol,
+                                    "image_url": t.image_url,
                                     "mcap": t.mcap,
+                                    "ath": t.ath,
+                                    "progress": t.progress,
+                                    "age": t.age.isoformat() if t.age else None,
                                     "viewers": t.viewers,
+                                    "creator": t.creator,
                                     "is_live": t.is_live,
-                                    "updated_at": t.updated_at.isoformat(),
+                                    "is_active": t.is_active,
                                 }
 
-                                # Add time-specific data based on time_period
+                                # Add time-specific data based on time_period only
                                 if time_period:
+                                    # Only include the specific time period data
                                     token_dict.update({
                                         f"volume_{time_period}": getattr(t, f"volume_{time_period}"),
                                         f"txns_{time_period}": getattr(t, f"txns_{time_period}"),
                                         f"traders_{time_period}": getattr(t, f"traders_{time_period}"),
                                     })
                                 else:
+                                    # Include all time periods (default behavior)
                                     token_dict.update({
                                         "volume_24h": t.volume_24h,
                                         "txns_24h": t.txns_24h,
                                         "traders_24h": t.traders_24h,
                                     })
 
-                                token_data.append(token_dict)
+                                # Add creator holding data
+                                token_dict.update({
+                                    "creator_holding_percentage": t.creator_holding_percentage,
+                                    "creator_is_top_holder": t.creator_is_top_holder,
+                                })
 
-                        else:  # full format
+                                token_data.append(token_dict)
+                        else:
                             # Full format - all fields (same as /tokens endpoint)
                             for t in tokens:
                                 token_dict = {
