@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -9,6 +10,7 @@ from sqlalchemy import and_, asc, desc, or_
 from sqlalchemy.orm import Session
 
 from ..models import Token, get_db
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -324,17 +326,17 @@ async def stream_tokens(
     min_mcap: Optional[float] = Query(None, description="Minimum market cap filter"),
     max_mcap: Optional[float] = Query(None, description="Maximum market cap filter"),
     # Pagination
-    limit: int = Query(50, description="Number of tokens to return", ge=1, le=1000),
+    limit: int = Query(1000, description="Number of tokens to return", ge=1, le=1000),
     offset: int = Query(0, description="Offset for pagination", ge=0),
     # Stream parameters
     update_interval: int = Query(
-        2, description="Update interval in seconds", ge=1, le=30
+        1, description="Update interval in seconds", ge=1, le=30
     ),
     # Response format
     format: str = Query(
-        "compact",
-        description="Response format: compact, full",
-        enum=["compact", "full"]
+        "full",
+        description="Response format: full",
+        enum=["full"]
     ),
 ):
     """
@@ -470,6 +472,27 @@ async def stream_tokens(
             db = next(get_db())
             last_update_time = None
 
+            # Subscribe to in-process sync events so we can push immediately when sync completes
+            from ..services.event_broadcaster import broadcaster
+            from ..services.sync_snapshot_service import get_latest_snapshot
+            sync_queue = await broadcaster.subscribe("sync_completed")
+            logger.info("SSE connection %s subscribed to sync_completed", connection_id)
+
+            # If there is a cached snapshot (from a sync that happened while no clients were connected), send it immediately
+            try:
+                snapshot = get_latest_snapshot()
+                if snapshot is not None:
+                    # Determine latest update time to avoid duplicate sends
+                    latest_update = (
+                        db.query(Token.updated_at).order_by(desc(Token.updated_at)).first()
+                    )
+                    last_update_time = latest_update[0] if latest_update else None
+                    logger.info("SSE connection %s sending cached snapshot (%d tokens)", connection_id, len(snapshot.get('data', {}).get('tokens', [])))
+                    yield f"data: {json.dumps(snapshot)}\n\n"
+            except Exception:
+                # If anything goes wrong sending snapshot, continue normal loop
+                pass
+
             while True:
                 try:
                     # Build query
@@ -500,155 +523,122 @@ async def stream_tokens(
                     current_update_time = latest_update[0] if latest_update else None
 
                     # Only send update if data has changed
-                    if current_update_time != last_update_time:
+                    # If a sync event arrived, force send immediately
+                    forced_send = False
+                    try:
+                        # non-blocking get
+                        payload = sync_queue.get_nowait()
+                        forced_send = True
+                        logger.info("SSE connection %s received sync event payload: %s", connection_id, payload)
+                    except asyncio.QueueEmpty:
+                        forced_send = False
+
+                    if current_update_time != last_update_time or forced_send:
                         # Apply pagination and get tokens
                         total_count = query.count()
                         tokens = query.offset(offset).limit(limit).all()
 
-                        # Format tokens based on requested format
+                        # Format tokens (always full format)
                         token_data = []
+                        # Full format - all fields (same as /tokens endpoint)
+                        for t in tokens:
+                            token_dict = {
+                                "id": t.id,
+                                "mint_address": t.mint_address,
+                                "name": t.name,
+                                "symbol": t.symbol,
+                                "image_url": t.image_url,
+                                "age": t.age.isoformat() if t.age else None,
+                                "mcap": t.mcap,
+                                "ath": t.ath,
+                                "creator": t.creator,
+                                "total_supply": t.total_supply,
+                                "pump_swap_pool": t.pump_swap_pool,
+                                "viewers": t.viewers,
+                                "progress": t.progress,
+                                "liquidity": t.liquidity,
+                                "is_live": t.is_live,
+                                "is_active": t.is_active,
+                                "nsfw": t.nsfw,
+                                "social_links": t.social_links,
+                            }
 
-                        if format == "compact":
-                            # Compact format - essential fields only
-                            for t in tokens:
-                                token_dict = {
-                                    "mint_address": t.mint_address,
-                                    "name": t.name,
-                                    "symbol": t.symbol,
-                                    "image_url": t.image_url,
-                                    "mcap": t.mcap,
-                                    "ath": t.ath,
-                                    "progress": t.progress,
-                                    "age": t.age.isoformat() if t.age else None,
-                                    "viewers": t.viewers,
-                                    "creator": t.creator,
-                                    "is_live": t.is_live,
-                                    "is_active": t.is_active,
+                            # Handle time-specific data for price_changes, traders, volume, txns
+                            if time_period:
+                                # Only include the specific time period data
+                                token_dict["price_changes"] = {
+                                    time_period: getattr(t, f"price_change_{time_period}")
+                                }
+                                token_dict["traders"] = {
+                                    time_period: getattr(t, f"traders_{time_period}")
+                                }
+                                token_dict["volume"] = {
+                                    time_period: getattr(t, f"volume_{time_period}")
+                                }
+                                token_dict["txns"] = {
+                                    time_period: getattr(t, f"txns_{time_period}")
+                                }
+                            else:
+                                # Include all time periods (default behavior)
+                                token_dict["price_changes"] = {
+                                    "5m": t.price_change_5m,
+                                    "1h": t.price_change_1h,
+                                    "6h": t.price_change_6h,
+                                    "24h": t.price_change_24h,
+                                }
+                                token_dict["traders"] = {
+                                    "5m": t.traders_5m,
+                                    "1h": t.traders_1h,
+                                    "6h": t.traders_6h,
+                                    "24h": t.traders_24h,
+                                }
+                                token_dict["volume"] = {
+                                    "5m": t.volume_5m,
+                                    "1h": t.volume_1h,
+                                    "6h": t.volume_6h,
+                                    "24h": t.volume_24h,
+                                }
+                                token_dict["txns"] = {
+                                    "5m": t.txns_5m,
+                                    "1h": t.txns_1h,
+                                    "6h": t.txns_6h,
+                                    "24h": t.txns_24h,
                                 }
 
-                                # Add time-specific data based on time_period only
-                                if time_period:
-                                    # Only include the specific time period data
-                                    token_dict.update({
-                                        f"volume_{time_period}": getattr(t, f"volume_{time_period}"),
-                                        f"txns_{time_period}": getattr(t, f"txns_{time_period}"),
-                                        f"traders_{time_period}": getattr(t, f"traders_{time_period}"),
-                                    })
-                                else:
-                                    # Include all time periods (default behavior)
-                                    token_dict.update({
-                                        "volume_24h": t.volume_24h,
-                                        "txns_24h": t.txns_24h,
-                                        "traders_24h": t.traders_24h,
-                                    })
-
-                                # Add creator holding data
-                                token_dict.update({
+                            # Add remaining fields
+                            token_dict.update({
+                                "pool_info": {
+                                    "raydium_pool": t.raydium_pool,
+                                    "virtual_sol_reserves": t.virtual_sol_reserves,
+                                    "real_sol_reserves": t.real_sol_reserves,
+                                    "virtual_token_reserves": t.virtual_token_reserves,
+                                    "real_token_reserves": t.real_token_reserves,
+                                    "complete": t.complete,
+                                },
+                                "activity": {
+                                    "reply_count": t.reply_count,
+                                    "last_reply": (
+                                        t.last_reply.isoformat() if t.last_reply else None
+                                    ),
+                                    "last_trade_timestamp": (
+                                        t.last_trade_timestamp.isoformat()
+                                        if t.last_trade_timestamp
+                                        else None
+                                    ),
+                                },
+                                "holders": {
+                                    "top_holders": t.top_holders,
+                                    "creator_holding_amount": t.creator_holding_amount,
                                     "creator_holding_percentage": t.creator_holding_percentage,
                                     "creator_is_top_holder": t.creator_is_top_holder,
-                                })
+                                },
+                                "timestamps": {
+                                    "created_at": t.created_at.isoformat(),
+                                    "updated_at": t.updated_at.isoformat(),
+                                },
+                            })
 
-                                token_data.append(token_dict)
-                        else:
-                            # Full format - all fields (same as /tokens endpoint)
-                            for t in tokens:
-                                token_dict = {
-                                    "id": t.id,
-                                    "mint_address": t.mint_address,
-                                    "name": t.name,
-                                    "symbol": t.symbol,
-                                    "image_url": t.image_url,
-                                    "age": t.age.isoformat() if t.age else None,
-                                    "mcap": t.mcap,
-                                    "ath": t.ath,
-                                    "creator": t.creator,
-                                    "total_supply": t.total_supply,
-                                    "pump_swap_pool": t.pump_swap_pool,
-                                    "viewers": t.viewers,
-                                    "progress": t.progress,
-                                    "liquidity": t.liquidity,
-                                    "is_live": t.is_live,
-                                    "is_active": t.is_active,
-                                    "nsfw": t.nsfw,
-                                    "social_links": t.social_links,
-                                }
-
-                                # Handle time-specific data for price_changes, traders, volume, txns
-                                if time_period:
-                                    # Only include the specific time period data
-                                    token_dict["price_changes"] = {
-                                        time_period: getattr(t, f"price_change_{time_period}")
-                                    }
-                                    token_dict["traders"] = {
-                                        time_period: getattr(t, f"traders_{time_period}")
-                                    }
-                                    token_dict["volume"] = {
-                                        time_period: getattr(t, f"volume_{time_period}")
-                                    }
-                                    token_dict["txns"] = {
-                                        time_period: getattr(t, f"txns_{time_period}")
-                                    }
-                                else:
-                                    # Include all time periods (default behavior)
-                                    token_dict["price_changes"] = {
-                                        "5m": t.price_change_5m,
-                                        "1h": t.price_change_1h,
-                                        "6h": t.price_change_6h,
-                                        "24h": t.price_change_24h,
-                                    }
-                                    token_dict["traders"] = {
-                                        "5m": t.traders_5m,
-                                        "1h": t.traders_1h,
-                                        "6h": t.traders_6h,
-                                        "24h": t.traders_24h,
-                                    }
-                                    token_dict["volume"] = {
-                                        "5m": t.volume_5m,
-                                        "1h": t.volume_1h,
-                                        "6h": t.volume_6h,
-                                        "24h": t.volume_24h,
-                                    }
-                                    token_dict["txns"] = {
-                                        "5m": t.txns_5m,
-                                        "1h": t.txns_1h,
-                                        "6h": t.txns_6h,
-                                        "24h": t.txns_24h,
-                                    }
-
-                                # Add remaining fields
-                                token_dict.update({
-                                    "pool_info": {
-                                        "raydium_pool": t.raydium_pool,
-                                        "virtual_sol_reserves": t.virtual_sol_reserves,
-                                        "real_sol_reserves": t.real_sol_reserves,
-                                        "virtual_token_reserves": t.virtual_token_reserves,
-                                        "real_token_reserves": t.real_token_reserves,
-                                        "complete": t.complete,
-                                    },
-                                    "activity": {
-                                        "reply_count": t.reply_count,
-                                        "last_reply": (
-                                            t.last_reply.isoformat() if t.last_reply else None
-                                        ),
-                                        "last_trade_timestamp": (
-                                            t.last_trade_timestamp.isoformat()
-                                            if t.last_trade_timestamp
-                                            else None
-                                        ),
-                                    },
-                                    "holders": {
-                                        "top_holders": t.top_holders,
-                                        "creator_holding_amount": t.creator_holding_amount,
-                                        "creator_holding_percentage": t.creator_holding_percentage,
-                                        "creator_is_top_holder": t.creator_is_top_holder,
-                                    },
-                                    "timestamps": {
-                                        "created_at": t.created_at.isoformat(),
-                                        "updated_at": t.updated_at.isoformat(),
-                                    },
-                                })
-
-                                token_data.append(token_dict)
+                            token_data.append(token_dict)
 
                         # Create SSE event with same structure as /tokens endpoint
                         event_data = {
@@ -672,6 +662,7 @@ async def stream_tokens(
                             },
                         }
 
+                        logger.info("SSE connection %s yielding tokens_update (tokens=%d)", connection_id, len(token_data))
                         yield f"data: {json.dumps(event_data)}\n\n"
                         last_update_time = current_update_time
 
@@ -691,7 +682,18 @@ async def stream_tokens(
                     await asyncio.sleep(update_interval)
 
         finally:
+            # Clean up subscription
+            try:
+                await broadcaster.unsubscribe("sync_completed", sync_queue)
+            except Exception:
+                pass
+            # Clean up subscription
+            try:
+                await broadcaster.unsubscribe("sync_completed", sync_queue)
+            except Exception:
+                pass
             active_connections.discard(connection_id)
+            logger.info("SSE connection %s unsubscribed and closed", connection_id)
 
     return StreamingResponse(
         generate(),

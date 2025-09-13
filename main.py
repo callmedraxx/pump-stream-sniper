@@ -41,6 +41,13 @@ async def lifespan(app: FastAPI):
 
     print("📊 Starting live tokens polling...")
     live_tokens_task = asyncio.create_task(poll_live_tokens())
+    # Start snapshot background task so SSE can serve last snapshot even if no clients were connected
+    try:
+        from src.services.sync_snapshot_service import run_forever as run_snapshot_service
+        asyncio.create_task(run_snapshot_service())
+        print("🗂️  Started sync snapshot service")
+    except Exception:
+        print("⚠️  Failed to start sync snapshot service")
 
     yield
     # Shutdown

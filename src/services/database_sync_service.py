@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..models import Token
 from ..services.fetch_activities import fetch_market_activities
+from ..services.event_broadcaster import broadcaster
 # TEMPORARILY DISABLED: from ..services.fetch_top_holders import TopHoldersService
 from ..services.token_service import TokenService
 
@@ -32,6 +33,23 @@ class DatabaseSyncService:
         self.executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="token_sync"
         )
+
+    def _normalize_price_change(self, val) -> float:
+        """Normalize incoming priceChangePercent to decimal fraction.
+
+        Converts values like 85.22 -> 0.8522. Keeps small fractional values as-is.
+        Returns 0.0 for invalid input.
+        """
+        try:
+            v = float(val)
+        except Exception:
+            return 0.0
+
+        # If API returns a percent like 85.22 (meaning 85.22%), convert to fraction 0.8522
+        # If API returns a small number like 0.85 or -0.17, assume it's already fraction
+        if abs(v) > 1 and abs(v) < 10000:
+            return v / 100.0
+        return v
 
     async def sync_live_tokens(
         self, live_tokens_data: List[Dict[str, Any]]
@@ -103,29 +121,47 @@ class DatabaseSyncService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        # TEMPORARILY DISABLED: Update holders data for all live tokens (run in background)
-        # if live_mint_addresses:
-        #     # Don't await this - let it run in background for better performance
-        #     asyncio.create_task(
-        #         self.update_holders_for_tokens(list(live_mint_addresses))
-        #     )
+            # TEMPORARILY DISABLED: Update holders data for all live tokens (run in background)
+            # if live_mint_addresses:
+            #     # Don't await this - let it run in background for better performance
+            #     asyncio.create_task(
+            #         self.update_holders_for_tokens(list(live_mint_addresses))
+            #     )
 
-        sync_time = time.time() - start_time
-        stats = {
-            "sync_time_seconds": round(sync_time, 2),
-            "new_tokens": len(new_mints),
-            "removed_tokens": len(removed_mints),
-            "updated_tokens": len(updated_mints),
-            "total_live_tokens": len(live_tokens_data),
-            "tokens_per_second": (
-                round(len(live_tokens_data) / sync_time, 2) if sync_time > 0 else 0
-            ),
-        }
+            sync_time = time.time() - start_time
+            stats = {
+                "sync_time_seconds": round(sync_time, 2),
+                "new_tokens": len(new_mints),
+                "removed_tokens": len(removed_mints),
+                "updated_tokens": len(updated_mints),
+                "total_live_tokens": len(live_tokens_data),
+                "tokens_per_second": (
+                    round(len(live_tokens_data) / sync_time, 2) if sync_time > 0 else 0
+                ),
+            }
 
-        logger.info(
-            f"Sync completed in {stats['sync_time_seconds']}s - {stats['tokens_per_second']} tokens/sec"
-        )
-        return stats
+            logger.info(
+                f"Sync completed in {stats['sync_time_seconds']}s - {stats['tokens_per_second']} tokens/sec"
+            )
+
+            # Publish sync completed event so subscribers (SSE/websocket) can react immediately
+            try:
+                logger.info("DatabaseSyncService publishing sync_completed: %s", stats)
+                # publish asynchronously but don't await if no loop; safest is to schedule
+                asyncio.create_task(broadcaster.publish("sync_completed", stats))
+            except Exception:
+                # If create_task fails (no running loop), try direct publish (sync)
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(broadcaster.publish("sync_completed", stats))
+                    else:
+                        # fallback: run until complete
+                        loop.run_until_complete(broadcaster.publish("sync_completed", stats))
+                except Exception:
+                    pass
+
+            return stats
 
     async def _add_new_tokens_parallel(self, new_tokens_data: List[Dict[str, Any]]):
         """Add new tokens with market activities in parallel"""
@@ -297,6 +333,8 @@ class DatabaseSyncService:
         activities_6h = (market_activities.get("6h") or {}) if market_activities and isinstance(market_activities, dict) else {}
         activities_24h = (market_activities.get("24h") or {}) if market_activities and isinstance(market_activities, dict) else {}
 
+    # Use the class-level normalizer to convert incoming percent values to decimal fractions
+
         return {
             # Core information (static fields) - handle nulls
             "mint_address": token_data.get("mint", ""),
@@ -318,11 +356,11 @@ class DatabaseSyncService:
             "progress": progress,
             "viewers": token_data.get("num_participants", 0) or 0,
             "liquidity": token_data.get("virtual_sol_reserves", 0) or 0,
-            # Price changes - defaults to 0
-            "price_change_5m": activities_5m.get("priceChangePercent", 0) or 0,
-            "price_change_1h": activities_1h.get("priceChangePercent", 0) or 0,
-            "price_change_6h": activities_6h.get("priceChangePercent", 0) or 0,
-            "price_change_24h": activities_24h.get("priceChangePercent", 0) or 0,
+            # Price changes - normalize and default to 0. Stored as decimal fraction (e.g., 0.85 for 85%)
+            "price_change_5m": self._normalize_price_change(activities_5m.get("priceChangePercent", 0) or 0),
+            "price_change_1h": self._normalize_price_change(activities_1h.get("priceChangePercent", 0) or 0),
+            "price_change_6h": self._normalize_price_change(activities_6h.get("priceChangePercent", 0) or 0),
+            "price_change_24h": self._normalize_price_change(activities_24h.get("priceChangePercent", 0) or 0),
             # Trader counts - defaults to 0
             "traders_5m": activities_5m.get("numUsers", 0) or 0,
             "traders_1h": activities_1h.get("numUsers", 0) or 0,
@@ -384,6 +422,8 @@ class DatabaseSyncService:
         activities_6h = (market_activities.get("6h") or {}) if market_activities and isinstance(market_activities, dict) else {}
         activities_24h = (market_activities.get("24h") or {}) if market_activities and isinstance(market_activities, dict) else {}
 
+    # Use class-level normalizer for incoming percent values
+
         return {
             # Dynamic fields only (static fields don't change)
             "mcap": mcap,
@@ -391,11 +431,11 @@ class DatabaseSyncService:
             "progress": progress,
             "viewers": token_data.get("num_participants", 0) or 0,
             "liquidity": token_data.get("virtual_sol_reserves", 0) or 0,
-            # Price changes - defaults to 0
-            "price_change_5m": activities_5m.get("priceChangePercent", 0) or 0,
-            "price_change_1h": activities_1h.get("priceChangePercent", 0) or 0,
-            "price_change_6h": activities_6h.get("priceChangePercent", 0) or 0,
-            "price_change_24h": activities_24h.get("priceChangePercent", 0) or 0,
+            # Price changes - normalize and default to 0. Stored as decimal fraction (e.g., 0.85 for 85%)
+            "price_change_5m": self._normalize_price_change(activities_5m.get("priceChangePercent", 0) or 0),
+            "price_change_1h": self._normalize_price_change(activities_1h.get("priceChangePercent", 0) or 0),
+            "price_change_6h": self._normalize_price_change(activities_6h.get("priceChangePercent", 0) or 0),
+            "price_change_24h": self._normalize_price_change(activities_24h.get("priceChangePercent", 0) or 0),
             # Trader counts - defaults to 0
             "traders_5m": activities_5m.get("numUsers", 0) or 0,
             "traders_1h": activities_1h.get("numUsers", 0) or 0,
