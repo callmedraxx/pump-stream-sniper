@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, asc, desc, or_
 from sqlalchemy.orm import Session
@@ -16,6 +16,8 @@ router = APIRouter()
 
 # Global state for SSE connections
 active_connections = set()
+# Global state for WebSocket connections
+ws_active_connections = set()
 
 
 class TokenSortService:
@@ -90,7 +92,7 @@ async def get_tokens(
     min_mcap: Optional[float] = Query(None, description="Minimum market cap filter"),
     max_mcap: Optional[float] = Query(None, description="Maximum market cap filter"),
     # Pagination
-    limit: int = Query(50, description="Number of tokens to return", ge=1, le=1000),
+    limit: int = Query(2000, description="Number of tokens to return", ge=1, le=1000),
     offset: int = Query(0, description="Offset for pagination", ge=0),
     # Response format
     format: str = Query("full", description="Response format: full, compact, minimal"),
@@ -489,6 +491,19 @@ async def stream_tokens(
                     last_update_time = latest_update[0] if latest_update else None
                     logger.info("SSE connection %s sending cached snapshot (%d tokens)", connection_id, len(snapshot.get('data', {}).get('tokens', [])))
                     yield f"data: {json.dumps(snapshot)}\n\n"
+                    # Drain any pending sync events for this connection so we don't immediately double-send
+                    try:
+                        drained = 0
+                        while True:
+                            try:
+                                _ = sync_queue.get_nowait()
+                                drained += 1
+                            except asyncio.QueueEmpty:
+                                break
+                        if drained:
+                            logger.info("SSE connection %s drained %d pending sync events after sending cached snapshot", connection_id, drained)
+                    except Exception:
+                        pass
             except Exception:
                 # If anything goes wrong sending snapshot, continue normal loop
                 pass
@@ -665,6 +680,19 @@ async def stream_tokens(
                         logger.info("SSE connection %s yielding tokens_update (tokens=%d)", connection_id, len(token_data))
                         yield f"data: {json.dumps(event_data)}\n\n"
                         last_update_time = current_update_time
+                        # Drain any pending sync events that arrived while we were preparing/sending
+                        try:
+                            drained = 0
+                            while True:
+                                try:
+                                    _ = sync_queue.get_nowait()
+                                    drained += 1
+                                except asyncio.QueueEmpty:
+                                    break
+                            if drained:
+                                logger.info("SSE connection %s drained %d pending sync events after yielding tokens_update", connection_id, drained)
+                        except Exception:
+                            pass
 
                     # Wait before next update
                     await asyncio.sleep(update_interval)
@@ -993,3 +1021,204 @@ async def refresh_token_holders(mint_address: str):
         raise HTTPException(
             status_code=500, detail=f"Error refreshing holders: {str(e)}"
         )
+
+
+@router.websocket("/ws/tokens_stream")
+async def websocket_tokens_stream(websocket: WebSocket):
+    """WebSocket endpoint that streams full tokens snapshot on DB changes."""
+    conn_id = id(websocket)
+    sync_queue = None
+    
+    try:
+        await websocket.accept()
+        ws_active_connections.add(conn_id)
+        logger.info("WebSocket %s connected to tokens_stream", conn_id)
+    except WebSocketDisconnect:
+        logger.info("WebSocket connection closed before accept()")
+        return
+    except Exception as e:
+        logger.exception("WebSocket accept failed: %s", e)
+        return
+
+    from ..services.event_broadcaster import broadcaster
+    from ..services.sync_snapshot_service import get_latest_snapshot
+
+    try:
+        # Subscribe to broadcaster with timeout
+        sync_queue = await asyncio.wait_for(
+            broadcaster.subscribe("sync_completed"), 
+            timeout=5.0
+        )
+        logger.info("WebSocket %s subscribed to sync_completed", conn_id)
+    except asyncio.TimeoutError:
+        logger.error("WebSocket %s subscription timeout", conn_id)
+        await _cleanup_connection(websocket, conn_id, sync_queue)
+        return
+    except Exception as e:
+        logger.exception("WebSocket %s failed to subscribe: %s", conn_id, e)
+        await _cleanup_connection(websocket, conn_id, sync_queue)
+        return
+
+    try:
+        # Send cached snapshot immediately
+        await _send_initial_snapshot(websocket, conn_id, sync_queue)
+        
+        # Main event loop with better error handling
+        await _handle_websocket_events(websocket, conn_id, sync_queue)
+        
+    except WebSocketDisconnect:
+        logger.info("WebSocket %s disconnected by client", conn_id)
+    except Exception as e:
+        logger.exception("WebSocket %s unexpected error: %s", conn_id, e)
+    finally:
+        await _cleanup_connection(websocket, conn_id, sync_queue)
+
+
+async def _send_initial_snapshot(websocket: WebSocket, conn_id: int, sync_queue):
+    """Send initial snapshot and drain queue to prevent double-sends."""
+    try:
+        from ..services.sync_snapshot_service import get_latest_snapshot
+        
+        snapshot = get_latest_snapshot()
+        if snapshot is not None:
+            logger.info("WebSocket %s sending cached snapshot (%d tokens)", 
+                       conn_id, len(snapshot.get('data', {}).get('tokens', [])))
+            
+            await asyncio.wait_for(
+                websocket.send_text(json.dumps(snapshot)), 
+                timeout=5.0
+            )
+            
+            # Drain queued events to prevent duplicates
+            drained = 0
+            try:
+                while drained < 100:  # Prevent infinite loop
+                    sync_queue.get_nowait()
+                    drained += 1
+            except asyncio.QueueEmpty:
+                pass
+            
+            if drained > 0:
+                logger.debug("WebSocket %s drained %d queued events", conn_id, drained)
+                
+    except asyncio.TimeoutError:
+        logger.warning("WebSocket %s initial snapshot send timeout", conn_id)
+        raise WebSocketDisconnect
+    except (RuntimeError, WebSocketDisconnect, ConnectionResetError):
+        logger.info("WebSocket %s disconnected during initial snapshot", conn_id)
+        raise WebSocketDisconnect
+    except Exception as e:
+        logger.exception("WebSocket %s initial snapshot error: %s", conn_id, e)
+        # Don't raise - continue to main loop
+
+
+async def _handle_websocket_events(websocket: WebSocket, conn_id: int, sync_queue):
+    """Main event loop with improved error handling and timeouts."""
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
+    while True:
+        try:
+            # Wait for sync event with timeout for heartbeat
+            try:
+                payload = await asyncio.wait_for(sync_queue.get(), timeout=25.0)
+                consecutive_errors = 0  # Reset error counter on success
+                logger.debug("WebSocket %s received sync event: %s", conn_id, payload)
+                
+                # Send updated snapshot
+                await _send_snapshot_update(websocket, conn_id, payload)
+                
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive
+                await _send_heartbeat(websocket, conn_id)
+                
+        except WebSocketDisconnect:
+            logger.info("WebSocket %s client disconnected", conn_id)
+            break
+        except Exception as e:
+            consecutive_errors += 1
+            logger.exception("WebSocket %s error in main loop (%d/%d): %s", 
+                           conn_id, consecutive_errors, max_consecutive_errors, e)
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error("WebSocket %s too many consecutive errors, closing", conn_id)
+                break
+                
+            # Brief sleep to prevent tight error loops
+            await asyncio.sleep(min(consecutive_errors, 5))
+
+
+async def _send_snapshot_update(websocket: WebSocket, conn_id: int, payload):
+    """Send snapshot update with timeout."""
+    try:
+        from ..services.sync_snapshot_service import get_latest_snapshot
+        
+        snapshot = get_latest_snapshot()
+        if snapshot is None:
+            # Send acknowledgment if no snapshot available
+            ack_msg = {"event": "sync_ack", "data": payload, "timestamp": datetime.now().isoformat()}
+            await asyncio.wait_for(
+                websocket.send_text(json.dumps(ack_msg)), 
+                timeout=5.0
+            )
+        else:
+            await asyncio.wait_for(
+                websocket.send_text(json.dumps(snapshot)), 
+                timeout=5.0
+            )
+            
+    except asyncio.TimeoutError:
+        logger.warning("WebSocket %s snapshot send timeout", conn_id)
+        raise WebSocketDisconnect
+    except (RuntimeError, WebSocketDisconnect, ConnectionResetError):
+        logger.info("WebSocket %s disconnected during snapshot send", conn_id)
+        raise WebSocketDisconnect
+
+
+async def _send_heartbeat(websocket: WebSocket, conn_id: int):
+    """Send heartbeat with timeout."""
+    try:
+        heartbeat_msg = {
+            "event": "heartbeat", 
+            "timestamp": datetime.now().isoformat()
+        }
+        await asyncio.wait_for(
+            websocket.send_text(json.dumps(heartbeat_msg)), 
+            timeout=5.0
+        )
+        logger.debug("WebSocket %s heartbeat sent", conn_id)
+    except asyncio.TimeoutError:
+        logger.warning("WebSocket %s heartbeat timeout", conn_id)
+        raise WebSocketDisconnect
+    except Exception as e:
+        logger.exception("WebSocket %s heartbeat failed: %s", conn_id, e)
+        raise WebSocketDisconnect
+
+
+async def _cleanup_connection(websocket: WebSocket, conn_id: int, sync_queue=None):
+    """Clean up WebSocket connection and resources."""
+    logger.info("WebSocket %s cleaning up", conn_id)
+    
+    # Clean up broadcaster subscription
+    if sync_queue is not None:
+        try:
+            from ..services.event_broadcaster import broadcaster
+            await asyncio.wait_for(
+                broadcaster.unsubscribe("sync_completed", sync_queue), 
+                timeout=3.0
+            )
+            logger.debug("WebSocket %s unsubscribed from broadcaster", conn_id)
+        except Exception as e:
+            logger.exception("WebSocket %s unsubscribe error: %s", conn_id, e)
+    
+    # Remove from active connections
+    ws_active_connections.discard(conn_id)
+    
+    # Close WebSocket connection
+    try:
+        if websocket.client_state != websocket.client_state.DISCONNECTED:
+            await asyncio.wait_for(websocket.close(), timeout=3.0)
+    except Exception as e:
+        logger.debug("WebSocket %s close error (expected): %s", conn_id, e)
+    
+    logger.info("WebSocket %s cleanup completed", conn_id)

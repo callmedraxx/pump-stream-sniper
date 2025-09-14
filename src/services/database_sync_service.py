@@ -305,14 +305,30 @@ class DatabaseSyncService:
 
     async def _remove_old_tokens_parallel(self, removed_mints: List[str]):
         """Remove tokens that are no longer live"""
-        logger.info(f"Removing {len(removed_mints)} old tokens")
+        logger.info("Removing %d old tokens", len(removed_mints))
 
-        for mint in removed_mints:
-            try:
-                self.token_service.delete_token(mint)
-                logger.debug(f"Removed token: {mint}")
-            except Exception as e:
-                logger.error(f"Error removing token {mint}: {e}")
+        if not removed_mints:
+            return
+
+        try:
+            # Use a single bulk DELETE for efficiency. synchronize_session=False is fine because
+            # we don't rely on ORM objects remaining in the session after delete.
+            deleted = (
+                self.db.query(Token)
+                .filter(Token.mint_address.in_(removed_mints))
+                .delete(synchronize_session=False)
+            )
+            self.db.commit()
+            logger.info("Bulk removed %d tokens", deleted)
+        except Exception as e:
+            logger.exception("Bulk delete failed, falling back to per-mint deletes: %s", e)
+            # Fallback: delete individually (slower) using token_service to preserve existing behavior
+            for mint in removed_mints:
+                try:
+                    self.token_service.delete_token(mint)
+                    logger.debug("Removed token: %s", mint)
+                except Exception as ex:
+                    logger.error("Error removing token %s: %s", mint, ex)
 
     def _prepare_token_data(
         self, token_data: Dict[str, Any], market_activities: Dict[str, Any] = None
