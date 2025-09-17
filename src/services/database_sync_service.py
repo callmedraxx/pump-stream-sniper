@@ -9,7 +9,7 @@ from sqlalchemy import and_, desc, or_
 from sqlalchemy.orm import Session
 
 from ..models import Token
-from ..services.fetch_activities import fetch_market_activities
+from ..services.fetch_activities import fetch_market_activities, fetch_market_activities_for_addresses
 from ..services.event_broadcaster import broadcaster
 # TEMPORARILY DISABLED: from ..services.fetch_top_holders import TopHoldersService
 from ..services.token_service import TokenService
@@ -164,148 +164,111 @@ class DatabaseSyncService:
             return stats
 
     async def _add_new_tokens_parallel(self, new_tokens_data: List[Dict[str, Any]]):
-        """Add new tokens with market activities in parallel"""
-        logger.info(f"Adding {len(new_tokens_data)} new tokens")
+        """Add new tokens using batch market activities fetching"""
+        if not new_tokens_data:
+            return
 
-        # Execute in parallel with semaphore to control concurrency
+        logger.info(f"Adding {len(new_tokens_data)} new tokens using batch market activities")
+
+        # Extract mint addresses for batch fetching
+        mint_addresses = [token.get("mint") for token in new_tokens_data if token.get("mint")]
+        
+        # Fetch market activities for all new tokens in batches
+        batch_activities = {}
+        if mint_addresses:
+            try:
+                batch_activities = await fetch_market_activities_for_addresses(mint_addresses)
+                logger.info(f"Successfully fetched market activities for {len(batch_activities)} tokens")
+            except Exception as e:
+                logger.error(f"Failed to fetch batch market activities for new tokens: {e}")
+                batch_activities = {}
+
+        # Create tokens with their market activities
         semaphore = asyncio.Semaphore(self.max_workers)
 
-        async def limited_task(token_data):
+        async def create_single_token(token_data):
             async with semaphore:
-                return await self._create_token_with_activities(token_data)
-
-        limited_tasks = [
-            limited_task(token_data)
-            for token_data in new_tokens_data
-        ]
-        await asyncio.gather(*limited_tasks, return_exceptions=True)
-
-    async def _create_token_with_activities(self, token_data: Dict[str, Any]):
-        """Create a single token with market activities"""
-        try:
-            # Debug: Check token_data structure
-            if not isinstance(token_data, dict):
-                logger.error(f"Invalid token_data type: {type(token_data)}, value: {token_data}")
-                return
-
-            pool_address = token_data.get("pump_swap_pool")
-            if pool_address is None or pool_address == "":
-                logger.debug(f"Token {token_data.get('mint')} has null/empty pump_swap_pool - will skip market activities")
-                pool_address = ""  # Use empty string instead of None
-
-            # Fetch market activities only if pump_swap_pool is valid
-            market_activities = {}
-            if pool_address and pool_address.strip():
                 try:
-                    result = await fetch_market_activities(pool_address)
-                    market_activities = result if isinstance(result, dict) else {}
-                    logger.debug(f"Fetched market activities for {token_data.get('symbol')}")
+                    mint_address = token_data.get("mint")
+                    market_activities = batch_activities.get(mint_address, {})
+                    
+                    # Create token data with activities
+                    token_dict = self._prepare_token_data(token_data, market_activities)
+                    
+                    # Create token in database
+                    self.token_service.create_token(token_dict)
+                    logger.debug(f"Created token: {token_data.get('symbol')}")
+                    
                 except Exception as e:
-                    logger.warning(f"Failed to fetch market activities for {token_data.get('mint')}: {e}")
-                    market_activities = {}  # Use empty dict as fallback
-            else:
-                logger.debug(f"Skipping market activities fetch for {token_data.get('symbol')} - invalid pump_swap_pool")
+                    logger.error(f"Error creating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")
 
-            # Ensure market_activities is always a dict
-            if not isinstance(market_activities, dict):
-                logger.warning(f"market_activities is not a dict, got {type(market_activities)} - using empty dict")
-                market_activities = {}
-
-            # Create token data with activities
-            token_dict = self._prepare_token_data(token_data, market_activities)
-
-            # Create token in database
-            self.token_service.create_token(token_dict)
-            #logger.debug(f"Created token: {token_data.get('symbol')}")
-
-        except Exception as e:
-            logger.error(f"Error creating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")
+        # Execute token creation in parallel
+        tasks = [create_single_token(token_data) for token_data in new_tokens_data]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _update_existing_tokens_parallel(
         self,
         updated_tokens_data: List[Dict[str, Any]],
         existing_tokens_dict: Dict[str, Token],
     ):
-        """Update existing tokens with latest data in parallel"""
-        logger.info(f"Updating {len(updated_tokens_data)} existing tokens")
+        """Update existing tokens using batch market activities fetching"""
+        if not updated_tokens_data:
+            return
 
-        # Execute in parallel with semaphore
+        logger.info(f"Updating {len(updated_tokens_data)} existing tokens using batch market activities")
+
+        # Extract mint addresses for batch fetching
+        mint_addresses = [token.get("mint") for token in updated_tokens_data if token.get("mint")]
+        
+        # Fetch market activities for all updated tokens in batches
+        batch_activities = {}
+        if mint_addresses:
+            try:
+                batch_activities = await fetch_market_activities_for_addresses(mint_addresses)
+                logger.info(f"Successfully fetched market activities for {len(batch_activities)} existing tokens")
+            except Exception as e:
+                logger.error(f"Failed to fetch batch market activities for existing tokens: {e}")
+                batch_activities = {}
+
+        # Update tokens with their market activities
         semaphore = asyncio.Semaphore(self.max_workers)
 
-        async def limited_task(token_data):
-            if token_data is None:
-                logger.error("Received None for token_data, skipping this task.")
-                return
-
-            #logger.info(f"Processing token_data: {token_data}")
-            existing_token = existing_tokens_dict.get(token_data.get("mint"))
-            if existing_token:
-                #logger.info(f"Found existing token for mint {token_data.get('mint')}: {existing_token}")
-                return await self._update_token_with_activities(token_data, existing_token)
-            else:
-                logger.warning(f"No existing token found for mint {token_data.get('mint')}")
-
-        limited_tasks = [
-            limited_task(token_data)
-            for token_data in updated_tokens_data
-        ]
-        await asyncio.gather(*limited_tasks, return_exceptions=True)
-
-    async def _update_token_with_activities(
-        self, token_data: Dict[str, Any], existing_token: Token
-    ):
-        """Update a single token with latest market activities"""
-        try:
-            # Debug: Check token_data structure
-            if not isinstance(token_data, dict):
-                logger.error(f"Invalid token_data type: {type(token_data)}, value: {token_data}")
-                return
-
-            #logger.info(f": {token_data}")
-
-            pool_address = token_data.get("pump_swap_pool")
-            if pool_address is None or pool_address == "":
-                logger.debug(f"Token {token_data.get('mint')} has null/empty pump_swap_pool - will skip market activities")
-                pool_address = ""  # Use empty string instead of None
-
-            # Fetch market activities only if pump_swap_pool is valid
-            market_activities = {}
-            if pool_address and pool_address.strip():
+        async def update_single_token(token_data):
+            async with semaphore:
                 try:
-                    #logger.info(f"Fetching market activities for pool_address: {pool_address}")
-                    result = await fetch_market_activities(pool_address)
-                    market_activities = result if isinstance(result, dict) else {}
+                    if token_data is None:
+                        logger.error("Received None for token_data, skipping this task.")
+                        return
 
-                    #logger.info(f"Fetched market activities: {market_activities}")
+                    mint_address = token_data.get("mint")
+                    existing_token = existing_tokens_dict.get(mint_address)
+                    
+                    if not existing_token:
+                        logger.warning(f"No existing token found for mint {mint_address}")
+                        return
+
+                    market_activities = batch_activities.get(mint_address, {})
+                    
+                    # Prepare update data
+                    update_data = self._prepare_update_data(token_data, market_activities)
+                    
+                    # Check if any fields actually changed
+                    if self._has_changes(existing_token, update_data):
+                        self.token_service.update_token(mint_address, update_data)
+                        logger.debug(f"Updated token: {token_data.get('symbol')}")
+                    else:
+                        logger.debug(f"No changes for token: {token_data.get('symbol')}")
+
                 except Exception as e:
-                    logger.warning(f"Failed to fetch market activities for {token_data.get('mint')}: {e}")
-                    market_activities = {}  # Use empty dict as fallback
-            else:
-                logger.debug(f"Skipping market activities fetch for {token_data.get('symbol')} - invalid pump_swap_pool")
+                    logger.error(f"Error updating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")
 
-            # Ensure market_activities is always a dict
-            if not isinstance(market_activities, dict):
-                logger.warning(f"market_activities is not a dict, got {type(market_activities)} - using empty dict")
-                market_activities = {}
-
-            # Prepare update data
-            update_data = self._prepare_update_data(token_data, market_activities)
-            #logger.info(f"Prepared update_data: {update_data}")
-
-            # Check if any fields actually changed
-            if self._has_changes(existing_token, update_data):
-                # Update token in database
-                self.token_service.update_token(token_data.get("mint"), update_data)
-                #logger.info(f"Updated token: {token_data.get('symbol')}")
-            else:
-                logger.debug(f"No changes for token: {token_data.get('symbol')}")
-
-        except Exception as e:
-            logger.error(f"Error updating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")
+        # Execute token updates in parallel  
+        tasks = [update_single_token(token_data) for token_data in updated_tokens_data]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _remove_old_tokens_parallel(self, removed_mints: List[str]):
         """Remove tokens that are no longer live"""
-        logger.info("Removing %d old tokens", len(removed_mints))
+        #logger.info("Removing %d old tokens", len(removed_mints))
 
         if not removed_mints:
             return
@@ -319,7 +282,7 @@ class DatabaseSyncService:
                 .delete(synchronize_session=False)
             )
             self.db.commit()
-            logger.info("Bulk removed %d tokens", deleted)
+            #logger.info("Bulk removed %d tokens", deleted)
         except Exception as e:
             logger.exception("Bulk delete failed, falling back to per-mint deletes: %s", e)
             # Fallback: delete individually (slower) using token_service to preserve existing behavior
@@ -429,8 +392,6 @@ class DatabaseSyncService:
         """Prepare update data for existing tokens (only dynamic fields)"""
         # Calculate progress
         mcap = token_data.get("usd_market_cap", token_data.get("market_cap", 0)) or 0
-        ath = token_data.get("ath_market_cap", mcap) or mcap
-        progress = (mcap / ath * 100) if ath > 0 else 0
 
         # Extract market activity data
         activities_5m = (market_activities.get("5m") or {}) if market_activities and isinstance(market_activities, dict) else {}
@@ -443,8 +404,6 @@ class DatabaseSyncService:
         return {
             # Dynamic fields only (static fields don't change)
             "mcap": mcap,
-            "ath": ath,
-            "progress": progress,
             "viewers": token_data.get("num_participants", 0) or 0,
             "liquidity": token_data.get("virtual_sol_reserves", 0) or 0,
             # Price changes - normalize and default to 0. Stored as decimal fraction (e.g., 0.85 for 85%)
@@ -496,8 +455,6 @@ class DatabaseSyncService:
         # Check dynamic fields for changes
         dynamic_fields = [
             "mcap",
-            "ath",
-            "progress",
             "viewers",
             "liquidity",
             "price_change_5m",

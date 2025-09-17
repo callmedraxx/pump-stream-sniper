@@ -9,7 +9,9 @@ from dotenv import load_dotenv
 from src.services.stream import fetch_and_relay_livestreams, connected_clients
 from src.routes.stream import router as websocket_router
 from src.routes.live import router as live_router
+from src.routes.vibe import router as vibe_router
 from src.services.fetch_live import poll_live_tokens
+from src.services.fetch_ath import start_background_loop, stop_background_loop
 from src.models import get_db, Token
 from src.models.database import create_tables
 
@@ -41,6 +43,12 @@ async def lifespan(app: FastAPI):
 
     print("📊 Starting live tokens polling...")
     live_tokens_task = asyncio.create_task(poll_live_tokens())
+    # Start ATH background loop (fetch ATH for complete==True every 60s)
+    try:
+        ath_task = start_background_loop(interval_seconds=60, batch_size=150, delay_between_batches=0.5)
+        print("⚡ Started ATH background loop")
+    except Exception as e:
+        print(f"⚠️ Failed to start ATH background loop: {e}")
     # Start snapshot background task so SSE can serve last snapshot even if no clients were connected
     try:
         from src.services.sync_snapshot_service import run_forever as run_snapshot_service
@@ -58,11 +66,18 @@ async def lifespan(app: FastAPI):
             await live_tokens_task
         except asyncio.CancelledError:
             pass
+    # Stop ATH background loop if running
+    try:
+        await stop_background_loop()
+        print("⚡ Stopped ATH background loop")
+    except Exception:
+        pass
 
 app = FastAPI(lifespan=lifespan)
 
 app.include_router(websocket_router)
 app.include_router(live_router)
+app.include_router(vibe_router)
 
 @app.get("/")
 async def get():

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..models import get_db
 from .database_sync_service import DatabaseSyncService
+from .event_broadcaster import broadcaster
 
 
 load_dotenv()
@@ -81,47 +82,47 @@ async def poll_live_tokens():
                         if isinstance(data, list) and len(data) > 2:
                             print(f"🔄 ... and {len(data) - 2} more tokens")
 
-                        # Calculate data hash to detect changes
-                        current_data_hash = (
-                            json.dumps(data, sort_keys=True)
-                            if isinstance(data, list)
-                            else None
-                        )
+                        # Always process the live tokens data to ensure fresh updates
+                        if isinstance(data, list) and data:
+                            # Calculate data hash to detect changes for logging purposes
+                            current_data_hash = json.dumps(data, sort_keys=True)
+                            data_changed = current_data_hash != last_data_hash
+                            
+                            if data_changed:
+                                print(f"🔄 Live tokens changed! Processing {len(data)} tokens")
+                            else:
+                                print(f"🔄 Processing {len(data)} live tokens (continuous updates)")
 
-                        if current_data_hash != last_data_hash:
-                            print(
-                                f"🔄 Live tokens changed! Processing {len(data) if isinstance(data, list) else 0} tokens"
-                            )
+                            # Always sync with database to ensure fresh data
+                            max_retries = 3
+                            sync_successful = False
+                            for attempt in range(max_retries):
+                                try:
+                                    sync_stats = await sync_service.sync_live_tokens(data)
+                                    print(f"⚡ Database sync completed: {sync_stats}")
+                                    sync_successful = True
+                                    break  # Success, exit retry loop
+                                except Exception as e:
+                                    print(f"❌ Database sync error (attempt {attempt + 1}/{max_retries}): {e}")
+                                    if attempt < max_retries - 1:
+                                        print("⏳ Retrying database sync in 2 seconds...")
+                                        await asyncio.sleep(2)
+                                    else:
+                                        print("❌ Max retries reached, skipping this sync cycle")
+                                        break
 
-                            # Sync with database in parallel
-                            if isinstance(data, list) and data:
-                                max_retries = 3
-                                for attempt in range(max_retries):
-                                    try:
-                                        sync_stats = await sync_service.sync_live_tokens(data)
-                                        print(f"⚡ Database sync completed: {sync_stats}")
-                                        break  # Success, exit retry loop
-                                    except Exception as e:
-                                        print(f"❌ Database sync error (attempt {attempt + 1}/{max_retries}): {e}")
-                                        if attempt < max_retries - 1:
-                                            print("⏳ Retrying database sync in 2 seconds...")
-                                            await asyncio.sleep(2)
-                                        else:
-                                            print("❌ Max retries reached, skipping this sync cycle")
-                                            break
+                            # ATH updates are handled exclusively by DatabaseSyncService to avoid races
 
-                                # Save sample data for inspection
-                                if len(data) > 0:
-                                    save_streamed_data_to_json(
-                                        data[:5], "latest_tokens_sample.json"
-                                    )
+                            # Save sample data for inspection
+                            if len(data) > 0:
+                                save_streamed_data_to_json(
+                                    data[:5], "latest_tokens_sample.json"
+                                )
 
                             last_data_hash = current_data_hash
-                            print(
-                                f"✅ Database synchronized with {len(data) if isinstance(data, list) else 0} live tokens"
-                            )
+                            print(f"✅ Database synchronized with {len(data)} live tokens")
                         else:
-                            print(f"✅ No changes in live tokens data")
+                            print(f"✅ No valid live tokens data received")
                     elif response.status == 429:
                         print(f"⚠️ Rate limited (429)! Pausing polling for 40 seconds...")
                         await asyncio.sleep(40)
