@@ -12,7 +12,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# The batch endpoint accepts at most 50 addresses per request
+# The batch endpoint accepts at most 50 addresses per request (observed from API)
 MAX_BATCH_SIZE = 50
 
 
@@ -64,7 +64,7 @@ async def fetch_market_activities(pool_address: str) -> Dict:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as response:
-                if response.status == 200:
+                if response.status == 200 or response.status == 201:
                     try:
                         data = await response.json()
                         if not data:
