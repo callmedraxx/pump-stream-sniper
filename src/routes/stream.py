@@ -35,6 +35,9 @@ async def websocket_tokens_endpoint(websocket: WebSocket):
         }
 
         db = next(get_db())
+        # subscribe to snapshot updates so we can forward them immediately
+        from ..services.event_broadcaster import broadcaster
+        snapshot_queue = await broadcaster.subscribe("snapshot_updated")
         last_update_time = None
 
         # Send initial connection confirmation
@@ -85,8 +88,16 @@ async def websocket_tokens_endpoint(websocket: WebSocket):
                 )
                 current_update_time = latest_update[0] if latest_update else None
 
-                # Send update if data changed
-                if current_update_time != last_update_time:
+                # Send update if data changed or if a snapshot update was published
+                forced_send = False
+                try:
+                    _ = snapshot_queue.get_nowait()
+                    forced_send = True
+                    # when snapshot_updated arrives, prefer immediate send
+                except asyncio.QueueEmpty:
+                    forced_send = False
+
+                if current_update_time != last_update_time or forced_send:
                     # Apply pagination and get tokens
                     total_count = query.count()
                     tokens = query.offset(current_sort["offset"]).limit(current_sort["limit"]).all()
@@ -99,6 +110,10 @@ async def websocket_tokens_endpoint(websocket: WebSocket):
                             "name": t.name,
                             "symbol": t.symbol,
                             "mcap": t.mcap,
+                            "dev_activity": t.dev_activity,
+                            "created_coin_count": t.created_coin_count,
+                            "creator_balance_sol": t.creator_balance_sol,
+                            "creator_balance_usd": t.creator_balance_usd,
                             "viewers": t.viewers,
                             "is_live": t.is_live,
                             "updated_at": t.updated_at.isoformat(),
@@ -136,6 +151,10 @@ async def websocket_tokens_endpoint(websocket: WebSocket):
 
     finally:
         active_connections.discard(id(websocket))
+        try:
+            await broadcaster.unsubscribe("snapshot_updated", snapshot_queue)
+        except Exception:
+            pass
 
 
 @router.websocket("/ws")

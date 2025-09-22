@@ -30,6 +30,10 @@ async def _build_snapshot(db) -> Dict[str, Any]:
             "age": t.age.isoformat() if t.age else None,
             "mcap": t.mcap,
             "ath": t.ath,
+            "dev_activity": t.dev_activity,
+            "created_coin_count": t.created_coin_count,
+            "creator_balance_sol": t.creator_balance_sol,
+            "creator_balance_usd": t.creator_balance_usd,
             "creator": t.creator,
             "total_supply": t.total_supply,
             "pump_swap_pool": t.pump_swap_pool,
@@ -64,6 +68,8 @@ async def _build_snapshot(db) -> Dict[str, Any]:
                 "6h": t.txns_6h,
                 "24h": t.txns_24h,
             },
+            # Candle data (time-series OHLC or similar) from Token model
+            "candle_data": t.candle_data,
             "pool_info": {
                 "raydium_pool": t.raydium_pool,
                 "virtual_sol_reserves": t.virtual_sol_reserves,
@@ -113,39 +119,106 @@ async def _build_snapshot(db) -> Dict[str, Any]:
 async def run_forever():
     """Background task: subscribe to sync events and update cached snapshot."""
     global _latest_snapshot
+    # Subscribe to both full-sync completions and token-level updates
+    q_sync = await broadcaster.subscribe("sync_completed")
+    q_token = await broadcaster.subscribe("token_updated")
+    logger.info("sync_snapshot_service subscribed to 'sync_completed' and 'token_updated' events")
 
-    # Subscribe
-    q = await broadcaster.subscribe("sync_completed")
-    logger.info("sync_snapshot_service subscribed to 'sync_completed' events")
+    async def _maybe_rebuild(source: str, payload: dict):
+        """Rebuild the snapshot and publish if content changed."""
+        nonlocal _latest_snapshot
+        logger.debug("sync_snapshot_service rebuilding snapshot due to %s", source)
+        try:
+            db = next(get_db())
+        except Exception:
+            db = None
+
+        if db is None:
+            logger.debug("sync_snapshot_service could not acquire DB connection")
+            return
+
+        try:
+            new_snapshot = await _build_snapshot(db)
+            async with _lock:
+                # Compare serialized data portion to avoid transient timestamps
+                old_data = _latest_snapshot.get('data') if _latest_snapshot else None
+                new_data = new_snapshot.get('data')
+                if old_data != new_data:
+                    _latest_snapshot = new_snapshot
+                    logger.info("sync_snapshot_service snapshot changed (%d tokens), publishing snapshot_updated", len(new_data.get('tokens', [])))
+                    # Publish a lightweight snapshot update event so SSE/WS routes can forward immediately
+                    try:
+                        await broadcaster.publish("snapshot_updated", {"snapshot": new_snapshot})
+                    except Exception:
+                        logger.exception("failed to publish snapshot_updated")
+                else:
+                    logger.debug("sync_snapshot_service snapshot unchanged; not publishing")
+        except Exception as e:
+            logger.exception("error building snapshot: %s", e)
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+
     try:
         while True:
-            payload = await q.get()
-            logger.info("sync_snapshot_service received sync_completed event: %s", payload)
-            # Build snapshot when a sync completes
-            try:
-                db = next(get_db())
-            except Exception:
-                db = None
+            # wait for either queue with small sleep resolution to be cooperative
+            done, pending = await asyncio.wait(
+                [q_sync.get(), q_token.get()],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-            if db is not None:
+            for fut in done:
                 try:
-                    snapshot = await _build_snapshot(db)
-                    async with _lock:
-                        _latest_snapshot = snapshot
-                    logger.info("sync_snapshot_service rebuilt snapshot with %d tokens", len(snapshot.get('data', {}).get('tokens', [])))
-                except Exception as e:
-                    logger.exception("error building snapshot: %s", e)
-                finally:
-                    try:
-                        db.close()
-                    except Exception:
-                        pass
+                    payload = fut.result()
+                except Exception:
+                    payload = None
+
+                if payload is None:
+                    continue
+
+                # Determine source by checking payload type or which queue produced it
+                # payloads from token_updated are small dicts with 'type' keys
+                src = "unknown"
+                if isinstance(payload, dict) and payload.get('type') in ("token_updated", "token_created"):
+                    src = "token_updated"
+                else:
+                    src = "sync_completed"
+
+                # Rebuild snapshot and possibly publish
+                await _maybe_rebuild(src, payload)
+
+            # cancel any pending futures to avoid leaked tasks
+            for p in pending:
+                try:
+                    p.cancel()
+                except Exception:
+                    pass
     finally:
         try:
-            await broadcaster.unsubscribe("sync_completed", q)
+            await broadcaster.unsubscribe("sync_completed", q_sync)
+        except Exception:
+            pass
+        try:
+            await broadcaster.unsubscribe("token_updated", q_token)
         except Exception:
             pass
 
 
 def get_latest_snapshot() -> Optional[Dict[str, Any]]:
     return _latest_snapshot
+
+
+async def publish_latest_snapshot() -> bool:
+    """Publish the current cached snapshot on the broadcaster under 'snapshot_updated'. Returns True if published."""
+    global _latest_snapshot
+    async with _lock:
+        if not _latest_snapshot:
+            return False
+        try:
+            await broadcaster.publish("snapshot_updated", {"snapshot": _latest_snapshot})
+            return True
+        except Exception:
+            logger.exception("failed to publish latest snapshot")
+            return False

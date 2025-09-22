@@ -6,6 +6,7 @@ from sqlalchemy import and_, desc, func, or_
 from sqlalchemy.orm import Session
 
 from ..models import Token
+from ..services.event_broadcaster import broadcaster
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,35 @@ class TokenService:
             self.db.add(token)
             self.db.commit()
             self.db.refresh(token)
+            # Publish token created/updated event for subscribers (SSE/WebSocket)
+            try:
+                payload = {
+                    "type": "token_created",
+                    "data": {
+                        "mint_address": token.mint_address,
+                        "symbol": token.symbol,
+                        "name": token.name,
+                        "mcap": token.mcap,
+                        "ath": token.ath,
+                        "progress": token.progress,
+                        "dev_activity": token.dev_activity,
+                        "created_coin_count": token.created_coin_count,
+                        "creator_balance_sol": token.creator_balance_sol,
+                        "creator_balance_usd": token.creator_balance_usd,
+                        "is_live": token.is_live,
+                        "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                    },
+                }
+                try:
+                    asyncio.create_task(broadcaster.publish("token_updated", payload))
+                except Exception:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(broadcaster.publish("token_updated", payload))
+                    else:
+                        loop.run_until_complete(broadcaster.publish("token_updated", payload))
+            except Exception:
+                logger.debug("Failed to publish token_created event for %s", token.mint_address)
             #logger.info(f"Created token: {token.symbol} ({token.mint_address[:8]}...)")
             return token
 
@@ -90,6 +120,34 @@ class TokenService:
             token.updated_at = datetime.now()
             self.db.commit()
             self.db.refresh(token)
+            # Publish token update event
+            try:
+                payload = {
+                    "type": "token_updated",
+                    "data": {
+                        "mint_address": token.mint_address,
+                        "symbol": token.symbol,
+                        "mcap": token.mcap,
+                        "ath": token.ath,
+                        "progress": token.progress,
+                        "dev_activity": token.dev_activity,
+                        "created_coin_count": token.created_coin_count,
+                        "creator_balance_sol": token.creator_balance_sol,
+                        "creator_balance_usd": token.creator_balance_usd,
+                        "is_live": token.is_live,
+                        "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                    },
+                }
+                try:
+                    asyncio.create_task(broadcaster.publish("token_updated", payload))
+                except Exception:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(broadcaster.publish("token_updated", payload))
+                    else:
+                        loop.run_until_complete(broadcaster.publish("token_updated", payload))
+            except Exception:
+                logger.debug("Failed to publish token_updated event for %s", token.mint_address)
             #logger.info(f"Updated token: {token.symbol}")
             return token
 
@@ -347,6 +405,37 @@ class TokenService:
             # Refresh all tokens
             for token in tokens:
                 self.db.refresh(token)
+
+            # Publish created events for all newly bulk-created tokens
+            for token in tokens:
+                try:
+                    payload = {
+                        "type": "token_created",
+                        "data": {
+                            "mint_address": token.mint_address,
+                            "symbol": token.symbol,
+                            "name": token.name,
+                            "mcap": token.mcap,
+                            "ath": token.ath,
+                            "progress": token.progress,
+                            "dev_activity": token.dev_activity,
+                            "created_coin_count": token.created_coin_count,
+                            "creator_balance_sol": token.creator_balance_sol,
+                            "creator_balance_usd": token.creator_balance_usd,
+                            "is_live": token.is_live,
+                            "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                        },
+                    }
+                    try:
+                        asyncio.create_task(broadcaster.publish("token_updated", payload))
+                    except Exception:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            loop.create_task(broadcaster.publish("token_updated", payload))
+                        else:
+                            loop.run_until_complete(broadcaster.publish("token_updated", payload))
+                except Exception:
+                    logger.debug("Failed to publish token_created event for %s", getattr(token, 'mint_address', None))
 
             logger.info(f"Bulk created {len(tokens)} tokens")
             return tokens

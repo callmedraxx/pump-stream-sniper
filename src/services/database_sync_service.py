@@ -228,7 +228,7 @@ class DatabaseSyncService:
                                 created_count_int = 1
 
                             token_dict["created_coin_count"] = created_count_int
-                            logger.info(f"Initial created_coin_count for new token {mint_address} set to {created_count_int} (creator={creator_addr})")
+                            #logger.info(f"Initial created_coin_count for new token {mint_address} set to {created_count_int} (creator={creator_addr})")
                         except Exception as e:
                             logger.warning(f"Failed to fetch created_coin_count for creator {creator_addr}: {e}")
                     # Fetch creator balances for this mint at creation
@@ -247,7 +247,7 @@ class DatabaseSyncService:
                     
                     # Create token in database
                     self.token_service.create_token(token_dict)
-                    logger.info(f"Created token: {token_data.get('symbol')} mint={mint_address} created_coin_count={token_dict.get('created_coin_count')} creator_balance_sol={token_dict.get('creator_balance_sol')} creator_balance_usd={token_dict.get('creator_balance_usd')}")
+                    #logger.info(f"Created token: {token_data.get('symbol')} mint={mint_address} created_coin_count={token_dict.get('created_coin_count')} creator_balance_sol={token_dict.get('creator_balance_sol')} creator_balance_usd={token_dict.get('creator_balance_usd')}")
                     
                 except Exception as e:
                     logger.error(f"Error creating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")

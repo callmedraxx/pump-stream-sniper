@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import copy
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -474,13 +475,13 @@ async def stream_tokens(
             db = next(get_db())
             last_update_time = None
 
-            # Subscribe to in-process sync events so we can push immediately when sync completes
+            # Subscribe to in-process snapshot updates so we can push immediately when relevant token fields change
             from ..services.event_broadcaster import broadcaster
             from ..services.sync_snapshot_service import get_latest_snapshot
-            sync_queue = await broadcaster.subscribe("sync_completed")
-            logger.info("SSE connection %s subscribed to sync_completed", connection_id)
+            snapshot_queue = await broadcaster.subscribe("snapshot_updated")
+            logger.info("SSE connection %s subscribed to snapshot_updated", connection_id)
 
-            # If there is a cached snapshot (from a sync that happened while no clients were connected), send it immediately
+                # If there is a cached snapshot (from a sync that happened while no clients were connected), send it immediately
             try:
                 snapshot = get_latest_snapshot()
                 if snapshot is not None:
@@ -491,17 +492,17 @@ async def stream_tokens(
                     last_update_time = latest_update[0] if latest_update else None
                     logger.info("SSE connection %s sending cached snapshot (%d tokens)", connection_id, len(snapshot.get('data', {}).get('tokens', [])))
                     yield f"data: {json.dumps(snapshot)}\n\n"
-                    # Drain any pending sync events for this connection so we don't immediately double-send
+                    # Drain any pending snapshot events for this connection so we don't immediately double-send
                     try:
                         drained = 0
                         while True:
                             try:
-                                _ = sync_queue.get_nowait()
+                                _ = snapshot_queue.get_nowait()
                                 drained += 1
                             except asyncio.QueueEmpty:
                                 break
                         if drained:
-                            logger.info("SSE connection %s drained %d pending sync events after sending cached snapshot", connection_id, drained)
+                            logger.info("SSE connection %s drained %d pending snapshot events after sending cached snapshot", connection_id, drained)
                     except Exception:
                         pass
             except Exception:
@@ -538,13 +539,13 @@ async def stream_tokens(
                     current_update_time = latest_update[0] if latest_update else None
 
                     # Only send update if data has changed
-                    # If a sync event arrived, force send immediately
+                    # If a snapshot event arrived, force send immediately
                     forced_send = False
                     try:
                         # non-blocking get
-                        payload = sync_queue.get_nowait()
+                        payload = snapshot_queue.get_nowait()
                         forced_send = True
-                        logger.info("SSE connection %s received sync event payload: %s", connection_id, payload)
+                        logger.info("SSE connection %s received snapshot event payload: %s", connection_id, payload)
                     except asyncio.QueueEmpty:
                         forced_send = False
 
@@ -566,6 +567,10 @@ async def stream_tokens(
                                 "age": t.age.isoformat() if t.age else None,
                                 "mcap": t.mcap,
                                 "ath": t.ath,
+                                "dev_activity": t.dev_activity,
+                                "created_coin_count": t.created_coin_count,
+                                "creator_balance_sol": t.creator_balance_sol,
+                                "creator_balance_usd": t.creator_balance_usd,
                                 "creator": t.creator,
                                 "total_supply": t.total_supply,
                                 "pump_swap_pool": t.pump_swap_pool,
@@ -680,17 +685,17 @@ async def stream_tokens(
                         logger.info("SSE connection %s yielding tokens_update (tokens=%d)", connection_id, len(token_data))
                         yield f"data: {json.dumps(event_data)}\n\n"
                         last_update_time = current_update_time
-                        # Drain any pending sync events that arrived while we were preparing/sending
+                        # Drain any pending snapshot events that arrived while we were preparing/sending
                         try:
                             drained = 0
                             while True:
                                 try:
-                                    _ = sync_queue.get_nowait()
+                                    _ = snapshot_queue.get_nowait()
                                     drained += 1
                                 except asyncio.QueueEmpty:
                                     break
                             if drained:
-                                logger.info("SSE connection %s drained %d pending sync events after yielding tokens_update", connection_id, drained)
+                                logger.info("SSE connection %s drained %d pending snapshot events after yielding tokens_update", connection_id, drained)
                         except Exception:
                             pass
 
@@ -712,12 +717,7 @@ async def stream_tokens(
         finally:
             # Clean up subscription
             try:
-                await broadcaster.unsubscribe("sync_completed", sync_queue)
-            except Exception:
-                pass
-            # Clean up subscription
-            try:
-                await broadcaster.unsubscribe("sync_completed", sync_queue)
+                await broadcaster.unsubscribe("snapshot_updated", snapshot_queue)
             except Exception:
                 pass
             active_connections.discard(connection_id)
@@ -1044,12 +1044,12 @@ async def websocket_tokens_stream(websocket: WebSocket):
     from ..services.sync_snapshot_service import get_latest_snapshot
 
     try:
-        # Subscribe to broadcaster with timeout
+        # Subscribe to snapshot updates with timeout so we get the full cached snapshot on changes
         sync_queue = await asyncio.wait_for(
-            broadcaster.subscribe("sync_completed"), 
+            broadcaster.subscribe("snapshot_updated"), 
             timeout=5.0
         )
-        logger.info("WebSocket %s subscribed to sync_completed", conn_id)
+        logger.info("WebSocket %s subscribed to snapshot_updated", conn_id)
     except asyncio.TimeoutError:
         logger.error("WebSocket %s subscription timeout", conn_id)
         await _cleanup_connection(websocket, conn_id, sync_queue)
@@ -1081,11 +1081,25 @@ async def _send_initial_snapshot(websocket: WebSocket, conn_id: int, sync_queue)
         
         snapshot = get_latest_snapshot()
         if snapshot is not None:
-            logger.info("WebSocket %s sending cached snapshot (%d tokens)", 
-                       conn_id, len(snapshot.get('data', {}).get('tokens', [])))
-            
+            # Deepcopy to avoid mutating the cached snapshot
+            snapshot_to_send = copy.deepcopy(snapshot)
+            tokens = snapshot_to_send.get('data', {}).get('tokens', []) or []
+            # Filter only tokens with is_live == True
+            filtered = [t for t in tokens if t.get('is_live')]
+            snapshot_to_send['data']['tokens'] = filtered
+            # Update pagination total/has_more if present
+            try:
+                if 'pagination' in snapshot_to_send.get('data', {}):
+                    snapshot_to_send['data']['pagination']['total'] = len(filtered)
+                    snapshot_to_send['data']['pagination']['has_more'] = False
+            except Exception:
+                pass
+
+            logger.info("WebSocket %s sending cached snapshot (%d live tokens)", 
+                       conn_id, len(filtered))
+
             await asyncio.wait_for(
-                websocket.send_text(json.dumps(snapshot)), 
+                websocket.send_text(json.dumps(snapshot_to_send)), 
                 timeout=5.0
             )
             
@@ -1162,6 +1176,7 @@ async def _send_snapshot_update(websocket: WebSocket, conn_id: int, payload):
                 timeout=5.0
             )
         else:
+            # If no cached snapshot, send ack (handled above by caller)
             await asyncio.wait_for(
                 websocket.send_text(json.dumps(snapshot)), 
                 timeout=5.0
@@ -1204,7 +1219,7 @@ async def _cleanup_connection(websocket: WebSocket, conn_id: int, sync_queue=Non
         try:
             from ..services.event_broadcaster import broadcaster
             await asyncio.wait_for(
-                broadcaster.unsubscribe("sync_completed", sync_queue), 
+                broadcaster.unsubscribe("snapshot_updated", sync_queue), 
                 timeout=3.0
             )
             logger.debug("WebSocket %s unsubscribed from broadcaster", conn_id)

@@ -72,7 +72,7 @@ class CreatorCountService:
                     try:
                         token.created_coin_count = count_int
                         self.db.commit()
-                        logger.info(f"Refreshed created_coin_count for {token.mint_address}: {count_int}")
+                        #logger.info(f"Refreshed created_coin_count for {token.mint_address}: {count_int}")
                     except Exception as e:
                         logger.warning(f"Failed to update DB for {token.mint_address}: {e}")
 
@@ -97,7 +97,7 @@ class CreatorCountService:
                 if token:
                     token.created_coin_count = int(count_int)
                     self.db.commit()
-                    logger.info(f"Refreshed created_coin_count for {mint_address}: {count_int}")
+                    #logger.info(f"Refreshed created_coin_count for {mint_address}: {count_int}")
             except Exception as e:
                 logger.warning(f"Failed to update DB for {mint_address}: {e}")
         except Exception as e:
