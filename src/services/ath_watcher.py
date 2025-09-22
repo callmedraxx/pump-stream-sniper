@@ -49,36 +49,16 @@ async def run_once(batch_size: int = 50, delay: float = 1.0, full_refresh_hours:
     db = next(get_db())
 
     try:
-        # 1) New tokens (ath == 0.0)
+        # Only fetch ATH for new tokens (ath == 0.0) - one-time setup
         new_tokens = db.query(Token).filter(Token.ath == 0.0).all()
         new_addresses = [t.mint_address for t in new_tokens]
         if new_addresses:
-            logger.info(f"ATH Watcher: found {len(new_addresses)} new tokens with ath=0.0; fetching ATH in batches")
+            logger.info(f"ATH Watcher: found {len(new_addresses)} new tokens with ath=0.0; fetching initial ATH in batches")
             stats = await fetch_and_update_for_addresses(new_addresses, batch_size=batch_size, delay=delay)
             logger.info(f"ATH Watcher: updated new tokens: {stats}")
 
-        # 2) Existing tokens where mcap >= ath (and ath > 0)
-        candidates = db.query(Token).filter(Token.ath > 0.0, Token.mcap >= Token.ath).all()
-        candidate_addresses = [t.mint_address for t in candidates]
-        if candidate_addresses:
-            logger.info(f"ATH Watcher: found {len(candidate_addresses)} tokens where mcap >= ath; refreshing ATH for them")
-            stats2 = await fetch_and_update_for_addresses(candidate_addresses, batch_size=batch_size, delay=delay)
-            logger.info(f"ATH Watcher: refreshed candidate tokens: {stats2}")
-
-        # 3) Full refresh every N hours (only for live tokens)
-        last_full = _read_last_full_refresh()
-        now = datetime.utcnow()
-        if (now - last_full) >= timedelta(hours=full_refresh_hours):
-            live_tokens = db.query(Token).filter(Token.is_live == True).all()
-            all_addresses = [t.mint_address for t in live_tokens]
-            logger.info(f"ATH Watcher: starting full refresh for {len(all_addresses)} live tokens")
-
-            # Process in batches via ATHService
-            stats3 = await fetch_and_update_for_addresses(all_addresses, batch_size=batch_size, delay=delay)
-            logger.info(f"ATH Watcher: full refresh completed: {stats3}")
-
-            # Update last full refresh timestamp
-            _write_last_full_refresh(now)
+        # Note: Real-time ATH updates are now handled by the websocket mcap updates in stream.py
+        # ATH is only increased when mcap exceeds current ATH, and progress is recalculated in real-time.
 
         duration = time.time() - start
         return {"duration_seconds": duration}

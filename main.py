@@ -10,6 +10,7 @@ from src.routes.live import router as live_router
 from src.routes.vibe import router as vibe_router
 from src.services.fetch_live import poll_live_tokens
 from src.services.fetch_ath import start_background_loop, stop_background_loop
+from src.services.creator_count_service import CreatorCountService
 from src.models import get_db, Token
 from src.models.database import create_tables
 from fastapi import FastAPI
@@ -65,6 +66,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         print("⚠️  Failed to start sync snapshot service")
 
+    # Start CreatorCountService (refresh created_coin_count every 10 minutes)
+    try:
+        creator_count_service = CreatorCountService()
+        creator_count_task = asyncio.create_task(creator_count_service.run_loop())
+        print("🔢 Started CreatorCountService background loop")
+    except Exception as e:
+        print(f"⚠️ Failed to start CreatorCountService: {e}")
+
     yield
     # Shutdown
     print("🛑 Shutting down background tasks...")
@@ -93,6 +102,16 @@ async def lifespan(app: FastAPI):
     try:
         await stop_background_loop()
         print("⚡ Stopped ATH background loop")
+    except Exception:
+        pass
+    # Stop CreatorCountService
+    try:
+        creator_count_task.cancel()
+        try:
+            await creator_count_task
+        except asyncio.CancelledError:
+            pass
+        print("🔢 Stopped CreatorCountService")
     except Exception:
         pass
 

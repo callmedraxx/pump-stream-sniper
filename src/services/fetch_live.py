@@ -77,7 +77,7 @@ async def poll_live_tokens():
                     if response.status == 200:
                         data = await response.json()
                         fetched_count = len(data) if isinstance(data, list) else 0
-                        print(f"📥 Fetched {fetched_count if fetched_count else 'N/A'} tokens from pump.fun")
+                        #print(f"📥 Fetched {fetched_count if fetched_count else 'N/A'} tokens from pump.fun")
 
                         if isinstance(data, list) and len(data) > 2:
                             print(f"🔄 ... and {len(data) - 2} more tokens")

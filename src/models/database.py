@@ -102,6 +102,36 @@ def ensure_token_columns():
             except Exception:
                 conn.execute(text('ALTER TABLE tokens ADD COLUMN IF NOT EXISTS live_since TIMESTAMP'))
             print("✅ Added missing column: tokens.live_since")
+        # Ensure dev_activity JSON column exists (added in recent schema updates)
+        if 'dev_activity' not in columns:
+            try:
+                conn.execute(text("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS dev_activity JSON"))
+                print("✅ Added missing column: tokens.dev_activity")
+            except Exception as e:
+                print(f"⚠️ Warning: failed to add tokens.dev_activity: {e}")
+
+        # Ensure created_coin_count integer column exists
+        if 'created_coin_count' not in columns:
+            try:
+                conn.execute(text("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS created_coin_count INTEGER DEFAULT 0 NOT NULL"))
+                print("✅ Added missing column: tokens.created_coin_count")
+            except Exception as e:
+                print(f"⚠️ Warning: failed to add tokens.created_coin_count: {e}")
+
+        # Ensure creator balance columns exist
+        if 'creator_balance_sol' not in columns:
+            try:
+                conn.execute(text("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS creator_balance_sol DOUBLE PRECISION"))
+                print("✅ Added missing column: tokens.creator_balance_sol")
+            except Exception as e:
+                print(f"⚠️ Warning: failed to add tokens.creator_balance_sol: {e}")
+
+        if 'creator_balance_usd' not in columns:
+            try:
+                conn.execute(text("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS creator_balance_usd DOUBLE PRECISION"))
+                print("✅ Added missing column: tokens.creator_balance_usd")
+            except Exception as e:
+                print(f"⚠️ Warning: failed to add tokens.creator_balance_usd: {e}")
 
 
 def drop_tables():

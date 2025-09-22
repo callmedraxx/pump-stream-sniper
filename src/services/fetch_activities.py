@@ -230,7 +230,7 @@ async def fetch_market_activities_batch(addresses: List[str]) -> Dict[str, Dict]
                 if response.status == 200 or response.status == 201:
                     try:
                         data = await response.json()
-                        logger.info(f"Successfully fetched market activities for {len(addresses)} tokens")
+                        #logger.info(f"Successfully fetched market activities for {len(addresses)} tokens")
                         return data
                     except json.JSONDecodeError as e:
                         error_msg = f"Invalid JSON response from batch API: {str(e)}"
@@ -352,7 +352,7 @@ async def fetch_market_activities_for_addresses(addresses: List[str]) -> Dict[st
     # Split addresses into batches
     for i in range(0, len(addresses), MAX_BATCH_SIZE):
         batch = addresses[i:i + MAX_BATCH_SIZE]
-        logger.info(f"Fetching market activities for batch {i//MAX_BATCH_SIZE + 1} ({len(batch)} addresses)")
+        #logger.info(f"Fetching market activities for batch {i//MAX_BATCH_SIZE + 1} ({len(batch)} addresses)")
         
         try:
             batch_response = await fetch_market_activities_batch(batch)
@@ -408,6 +408,255 @@ async def get_market_activities_by_mint_batch(mint_address: str) -> Dict:
     except Exception as e:
         logger.error(f"Failed to fetch market activities for mint {mint_address}: {e}")
         return convert_batch_response_to_legacy_format({})
+
+
+async def fetch_creator_trades_for_mint(mint_address: str, creator_address: str) -> dict:
+    """
+    Fetch recent trades for a specific mint filtered by creator/user addresses using the trades batch endpoint.
+    Returns the latest trade info for that creator if present.
+    """
+    if not mint_address or not creator_address:
+        return {}
+
+    url = f"https://swap-api.pump.fun/v1/coins/{mint_address}/trades/batch"
+
+    headers = {
+        "Host": "swap-api.pump.fun",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Not=A?Brand";v="24", "Chromium";v="140"',
+        "Content-Type": "application/json",
+        "Sec-Ch-Ua-Mobile": "?0",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Origin": "https://pump.fun",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Priority": "u=1, i",
+    }
+
+    payload = {"userAddresses": [creator_address]}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status in (200, 201):
+                    try:
+                        data = await resp.json()
+                        # data is expected to be {creator_address: [trades...]}
+                        creator_trades = data.get(creator_address) or []
+                        if not creator_trades:
+                            return {}
+                        # Return the most recent trade (assuming sorted newest first)
+                        latest = creator_trades[0]
+                        # Normalize fields we need
+                        return {
+                            "type": latest.get("type"),
+                            "amountUSD": float(latest.get("amountUSD", 0)) if latest.get("amountUSD") else None,
+                            "amountSOL": float(latest.get("amountSOL", 0)) if latest.get("amountSOL") else None,
+                            "timestamp": latest.get("timestamp"),
+                            "userAddress": latest.get("userAddress"),
+                            "tx": latest.get("tx"),
+                        }
+                    except Exception as e:
+                        logger.warning(f"Failed parsing creator trades response for {mint_address}: {e}")
+                        return {}
+                else:
+                    logger.warning(f"Creator trades API returned {resp.status} for {mint_address}")
+                    return {}
+    except Exception as e:
+        logger.error(f"Network error fetching creator trades for {mint_address}: {e}")
+        return {}
+
+
+async def fetch_creator_created_count(creator_address: str, offset: int = 0, limit: int = 1000, include_nsfw: bool = False) -> int:
+    """
+    Fetch the number of coins created by a given creator address using frontend-api-v3.
+
+    Returns the `count` integer from the API response, or 0 on error.
+    """
+    if not creator_address:
+        return 0
+
+    url = f"https://frontend-api-v3.pump.fun/coins/user-created-coins/{creator_address}?offset={offset}&limit=10&includeNsfw={'true' if include_nsfw else 'false'}"
+
+    headers = {
+        "Host": "frontend-api-v3.pump.fun",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Not=A?Brand";v="24", "Chromium";v="140"',
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Accept": "*/*",
+        "Origin": "https://pump.fun",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Priority": "u=1, i",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status in (200, 201):
+                    try:
+                        data = await resp.json()
+                        # Expect response like {"count": 42, ...}
+                        count = int(data.get("count", 0) or 0)
+                        return count
+                    except Exception as e:
+                        logger.warning(f"Failed parsing created-count response for {creator_address}: {e}")
+                        return 0
+                else:
+                    logger.warning(f"Created-count API returned {resp.status} for {creator_address}")
+                    return 0
+    except Exception as e:
+        logger.error(f"Network error fetching created-count for {creator_address}: {e}")
+        return 0
+
+
+async def fetch_creator_created_counts(
+    creator_addresses,
+    concurrency: int = 3,
+    max_retries: int = 3,
+    base_backoff: float = 0.5,
+):
+    """
+    Fetch created_coin_count for multiple creators with limited concurrency and retries.
+
+    Returns a dict mapping creator_address -> count (int). On error, the value will be 0.
+    This reduces rate-limit errors by reusing an aiohttp session, limiting concurrency,
+    and retrying with exponential backoff when HTTP 429 is encountered.
+    """
+    if not creator_addresses:
+        return {}
+
+    results = {}
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _fetch_with_retries(session, creator):
+        url = (
+            f"https://frontend-api-v3.pump.fun/coins/user-created-coins/{creator}?offset=0&limit=10&includeNsfw=false"
+        )
+        headers = {
+            "Host": "frontend-api-v3.pump.fun",
+            "Sec-Ch-Ua-Platform": '"macOS"',
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Ch-Ua": '"Not=A?Brand";v="24", "Chromium";v="140"',
+            "User-Agent": "pump-stream-sniper/1.0",
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Accept": "*/*",
+            "Origin": "https://pump.fun",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Priority": "u=1, i",
+        }
+
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                async with sem:
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                        if resp.status in (200, 201):
+                            try:
+                                data = await resp.json()
+                                count = int(data.get("count", 0) or 0)
+                                return count
+                            except Exception as e:
+                                logger.warning(f"Failed parsing created-count for {creator}: {e}")
+                                return 0
+                        elif resp.status == 429:
+                            # Rate limited — backoff and retry
+                            attempt += 1
+                            backoff = base_backoff * (2 ** (attempt - 1))
+                            logger.debug(f"429 for {creator}, retrying in {backoff}s (attempt {attempt})")
+                            await asyncio.sleep(backoff)
+                            continue
+                        else:
+                            logger.warning(f"Created-count API returned {resp.status} for {creator}")
+                            return 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Network error fetching created-count for {creator}: {e}")
+                attempt += 1
+                backoff = base_backoff * (2 ** (attempt - 1))
+                await asyncio.sleep(backoff)
+
+        # If we exhausted retries, return 0
+        logger.warning(f"Exhausted retries fetching created count for {creator}")
+        return 0
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            asyncio.create_task(_fetch_with_retries(session, creator)) for creator in creator_addresses
+        ]
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for creator, val in zip(creator_addresses, results_list):
+        if isinstance(val, Exception):
+            logger.warning(f"Error fetching created-count for {creator}: {val}")
+            results[creator] = 0
+        else:
+            results[creator] = int(val or 0)
+
+    return results
+
+async def fetch_creator_balance_for_mint(creator_address: str, target_mint: str, page: int = 1, limit: int = 1000) -> dict:
+    """
+    Fetch wallet balances for creator and return the balance and balanceUSD for target_mint.
+
+    Returns dict {"balance": float, "balanceUSD": float} or {} if not found.
+    """
+    if not creator_address or not target_mint:
+        return {}
+
+    url = f"https://swap-api.pump.fun/v1/wallet/{creator_address}/balances?includePnl=true&page={page}&limit=10"
+
+    headers = {
+        "Host": "swap-api.pump.fun",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Not=A?Brand";v="24", "Chromium";v="140"',
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Accept": "*/*",
+        "Origin": "https://pump.fun",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Priority": "u=1, i",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status in (200, 201):
+                    try:
+                        data = await resp.json()
+                        items = data.get("items", []) or []
+                        for it in items:
+                            if it.get("mint") == target_mint:
+                                return {
+                                    "balance": float(it.get("balance")) if it.get("balance") is not None else None,
+                                    "balanceUSD": float(it.get("balanceUSD")) if it.get("balanceUSD") is not None else None,
+                                }
+                        return {}
+                    except Exception as e:
+                        logger.warning(f"Failed parsing wallet balances for {creator_address}: {e}")
+                        return {}
+                else:
+                    logger.warning(f"Wallet balances API returned {resp.status} for {creator_address}")
+                    return {}
+    except Exception as e:
+        logger.error(f"Network error fetching wallet balances for {creator_address}: {e}")
+        return {}
 
 
 # Backward compatibility: make the old function use the new batch method for better reliability

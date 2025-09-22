@@ -73,7 +73,7 @@ class ATHService:
         }
 
         try:
-            logger.info(f"Fetching ATH for batch of {len(addresses)} tokens")
+            #logger.info(f"Fetching ATH for batch of {len(addresses)} tokens")
             
             async with session.post(
                 self.api_url,
@@ -101,12 +101,12 @@ class ATHService:
                             else:
                                 # Token has no ATH data (null response)
                                 result[address] = None
-                                logger.warning(f"No ATH data available for token {address}")
+                                #logger.warning(f"No ATH data available for token {address}")
                         else:
                             result[address] = None
                             logger.warning(f"Token {address} not found in ATH response")
                     
-                    logger.info(f"Successfully fetched ATH for {len([v for v in result.values() if v is not None])} out of {len(addresses)} tokens")
+                    #logger.info(f"Successfully fetched ATH for {len([v for v in result.values() if v is not None])} out of {len(addresses)} tokens")
                     return result
                 
                 elif response.status == 429:
@@ -154,7 +154,7 @@ class ATHService:
             logger.info("No addresses provided for ATH fetching")
             return {}
 
-        logger.info(f"Starting ATH fetch for {len(addresses)} tokens in batches of {self.batch_size}")
+        #logger.info(f"Starting ATH fetch for {len(addresses)} tokens in batches of {self.batch_size}")
 
         batches = self.split_into_batches(addresses)
 
@@ -170,7 +170,7 @@ class ATHService:
         async with aiohttp.ClientSession() as session:
             for i, batch in enumerate(batches):
                 try:
-                    logger.info(f"Processing batch {i + 1}/{len(batches)} ({len(batch)} tokens)")
+                    #logger.info(f"Processing batch {i + 1}/{len(batches)} ({len(batch)} tokens)")
 
                     # Fetch ATH data for this batch
                     batch_ath_data = await self.fetch_ath_batch(batch, session)
@@ -486,13 +486,13 @@ async def run_loop(interval_seconds: int = 60, batch_size: int = 100, delay_betw
             # Query DB for tokens with complete == True
             db = next(get_db())
             try:
-                # Only fetch ATH for tokens that are currently live
-                tokens = db.query(Token).filter(Token.is_live == True).all()
+                # Only fetch ATH for NEW tokens that have ath == 0.0 (one-time initial ATH fetch)
+                tokens = db.query(Token).filter(Token.is_live == True, Token.ath == 0.0).all()
                 if not tokens:
-                    logger.debug("No live tokens found for ATH update")
+                    logger.debug("No new live tokens with ath==0.0 found for ATH update")
                 else:
                     addresses = [t.mint_address for t in tokens]
-                    logger.info(f"Found {len(addresses)} live tokens to update ATH")
+                    logger.info(f"Found {len(addresses)} new live tokens (ath==0.0) to fetch initial ATH")
 
                     # Reuse DB session during this fetch so update_token_ath can reuse it
                     service.db = db

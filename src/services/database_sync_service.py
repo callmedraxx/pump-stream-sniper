@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from ..models import Token
 from ..services.fetch_candles import CandleFetchService
 from ..services.fetch_activities import fetch_market_activities, fetch_market_activities_for_addresses
+from ..services.fetch_activities import fetch_creator_trades_for_mint, fetch_creator_created_count, fetch_creator_balance_for_mint
 from ..services.event_broadcaster import broadcaster
 # TEMPORARILY DISABLED: from ..services.fetch_top_holders import TopHoldersService
 from ..services.token_service import TokenService
@@ -141,9 +142,9 @@ class DatabaseSyncService:
                 ),
             }
 
-            logger.info(
-                f"Sync completed in {stats['sync_time_seconds']}s - {stats['tokens_per_second']} tokens/sec"
-            )
+            # logger.info(
+            #     f"Sync completed in {stats['sync_time_seconds']}s - {stats['tokens_per_second']} tokens/sec"
+            # )
 
             # Fetch and update candle data for live tokens
             try:
@@ -185,7 +186,7 @@ class DatabaseSyncService:
         if mint_addresses:
             try:
                 batch_activities = await fetch_market_activities_for_addresses(mint_addresses)
-                logger.info(f"Successfully fetched market activities for {len(batch_activities)} tokens")
+                #logger.info(f"Successfully fetched market activities for {len(batch_activities)} tokens")
             except Exception as e:
                 logger.error(f"Failed to fetch batch market activities for new tokens: {e}")
                 batch_activities = {}
@@ -198,13 +199,55 @@ class DatabaseSyncService:
                 try:
                     mint_address = token_data.get("mint")
                     market_activities = batch_activities.get(mint_address, {})
+
+                    # Fetch dev/creator last activity once at creation
+                    dev_activity = {}
+                    creator_addr = token_data.get("creator")
+                    if creator_addr and mint_address:
+                        try:
+                            dev_activity = await fetch_creator_trades_for_mint(mint_address, creator_addr)
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch creator trades for {mint_address}: {e}")
                     
                     # Create token data with activities
                     token_dict = self._prepare_token_data(token_data, market_activities)
+                    if dev_activity:
+                        token_dict["dev_activity"] = dev_activity
+                    # Fetch creator created coin count once at creation
+                    if creator_addr:
+                        try:
+                            created_count = await fetch_creator_created_count(creator_addr)
+                            # API returns integer count; enforce business rule: cannot be None or 0
+                            try:
+                                created_count_int = int(created_count or 0)
+                            except Exception:
+                                created_count_int = 0
+
+                            if created_count_int <= 0:
+                                # If API reports 0, set to 1 per business rule
+                                created_count_int = 1
+
+                            token_dict["created_coin_count"] = created_count_int
+                            logger.info(f"Initial created_coin_count for new token {mint_address} set to {created_count_int} (creator={creator_addr})")
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch created_coin_count for creator {creator_addr}: {e}")
+                    # Fetch creator balances for this mint at creation
+                    if creator_addr and mint_address:
+                        try:
+                            balance_info = await fetch_creator_balance_for_mint(creator_addr, mint_address)
+                            if balance_info:
+                                token_dict["creator_balance_sol"] = balance_info.get("balance")
+                                token_dict["creator_balance_usd"] = balance_info.get("balanceUSD")
+                                logger.info(
+                                    f"Initial creator balance for new token {mint_address} (creator={creator_addr}): "
+                                    f"sol={token_dict.get('creator_balance_sol')} usd={token_dict.get('creator_balance_usd')}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch creator balance for {creator_addr}/{mint_address}: {e}")
                     
                     # Create token in database
                     self.token_service.create_token(token_dict)
-                    logger.debug(f"Created token: {token_data.get('symbol')}")
+                    logger.info(f"Created token: {token_data.get('symbol')} mint={mint_address} created_coin_count={token_dict.get('created_coin_count')} creator_balance_sol={token_dict.get('creator_balance_sol')} creator_balance_usd={token_dict.get('creator_balance_usd')}")
                     
                 except Exception as e:
                     logger.error(f"Error creating token {token_data.get('mint') if isinstance(token_data, dict) else 'unknown'}: {e}")
@@ -232,7 +275,7 @@ class DatabaseSyncService:
         if mint_addresses:
             try:
                 batch_activities = await fetch_market_activities_for_addresses(mint_addresses)
-                logger.info(f"Successfully fetched market activities for {len(batch_activities)} existing tokens")
+                #logger.info(f"Successfully fetched market activities for {len(batch_activities)} existing tokens")
             except Exception as e:
                 logger.error(f"Failed to fetch batch market activities for existing tokens: {e}")
                 batch_activities = {}
@@ -462,7 +505,8 @@ class DatabaseSyncService:
 
         return {
             # Dynamic fields only (static fields don't change)
-            "mcap": mcap,
+            # Note: mcap is now updated only from websocket trades, not from fetch_live
+            #"mcap": mcap,
             "viewers": token_data.get("num_participants", 0) or 0,
             "liquidity": token_data.get("virtual_sol_reserves", 0) or 0,
             # Price changes - normalize and default to 0. Stored as decimal fraction (e.g., 0.85 for 85%)

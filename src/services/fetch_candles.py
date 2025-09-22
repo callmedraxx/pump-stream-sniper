@@ -76,7 +76,7 @@ class CandleFetchService:
                         else:
                             wait = backoff_base ** (attempt - 1)
 
-                        logger.warning(f"Failed to fetch candles for {mint_address}: HTTP 429 (retry {attempt}/{max_retries}), sleeping {wait}s")
+                        #logger.warning(f"Failed to fetch candles for {mint_address}: HTTP 429 (retry {attempt}/{max_retries}), sleeping {wait}s")
                         await asyncio.sleep(wait)
                         continue
 
@@ -88,7 +88,7 @@ class CandleFetchService:
                         continue
 
                     # Other non-success statuses: log and don't retry
-                    logger.warning(f"Failed to fetch candles for {mint_address}: HTTP {status}")
+                    #logger.warning(f"Failed to fetch candles for {mint_address}: HTTP {status}")
                     return None
 
             except asyncio.CancelledError:

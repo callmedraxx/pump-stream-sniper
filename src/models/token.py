@@ -117,6 +117,17 @@ class Token(Base):
     # Raw data backup (for debugging and future compatibility)
     raw_data = Column(JSON, nullable=True)
 
+    # Developer/creator last activity (stored as JSON):
+    # {"type": "buy"/"sell", "amountUSD": float, "amountSOL": float, "timestamp": ISO8601, "userAddress": str}
+    dev_activity = Column(JSON, nullable=True)
+
+    # Creator's total created coin count (fetched from frontend API)
+    created_coin_count = Column(Integer, nullable=False, default=0)
+
+    # Creator's token balances for this token (SOL and USD)
+    creator_balance_sol = Column(Float, nullable=True)
+    creator_balance_usd = Column(Float, nullable=True)
+
     # Candle data from pump.fun API
     candle_data = Column(JSON, nullable=True)
 
