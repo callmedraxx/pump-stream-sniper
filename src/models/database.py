@@ -2,7 +2,7 @@ import os
 from typing import Generator
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
@@ -63,8 +63,45 @@ def create_tables():
     Create all database tables
     Call this once when the application starts
     """
+    # Create any new tables (won't alter existing tables' columns)
     Base.metadata.create_all(bind=engine)
+
+    # Try to ensure token columns exist (best-effort simple migration)
+    try:
+        ensure_token_columns()
+    except Exception as e:
+        print(f"⚠️ Warning: failed to ensure token columns exist: {e}")
+
     print("✅ Database tables created successfully")
+
+
+def ensure_token_columns():
+    """Ensure required columns exist on the tokens table (idempotent).
+
+    This is a small, best-effort migration helper to add the `candle_data` JSON
+    column if it's missing. It uses `ALTER TABLE ... IF NOT EXISTS` so it's safe
+    to call repeatedly.
+    """
+    inspector = inspect(engine)
+    if 'tokens' not in inspector.get_table_names():
+        # Table isn't present yet; metadata.create_all should handle creation.
+        return
+
+    columns = {c['name'] for c in inspector.get_columns('tokens')}
+
+    with engine.begin() as conn:
+        if 'candle_data' not in columns:
+            # Use IF NOT EXISTS for safety across Postgres versions
+            conn.execute(text('ALTER TABLE tokens ADD COLUMN IF NOT EXISTS candle_data JSON'))
+            print("✅ Added missing column: tokens.candle_data")
+        # Add live_since timestamp if missing (tokens.live_since was added later)
+        if 'live_since' not in columns:
+            # Use TIMESTAMP WITH TIME ZONE for portability; fall back to TIMESTAMP if not supported
+            try:
+                conn.execute(text('ALTER TABLE tokens ADD COLUMN IF NOT EXISTS live_since TIMESTAMP WITH TIME ZONE'))
+            except Exception:
+                conn.execute(text('ALTER TABLE tokens ADD COLUMN IF NOT EXISTS live_since TIMESTAMP'))
+            print("✅ Added missing column: tokens.live_since")
 
 
 def drop_tables():

@@ -9,6 +9,7 @@ from sqlalchemy import and_, desc, or_
 from sqlalchemy.orm import Session
 
 from ..models import Token
+from ..services.fetch_candles import CandleFetchService
 from ..services.fetch_activities import fetch_market_activities, fetch_market_activities_for_addresses
 from ..services.event_broadcaster import broadcaster
 # TEMPORARILY DISABLED: from ..services.fetch_top_holders import TopHoldersService
@@ -84,7 +85,7 @@ class DatabaseSyncService:
         updated_mints = live_mint_addresses & existing_mint_addresses
 
         logger.info(
-            f"Sync stats: {len(new_mints)} new, {len(removed_mints)} removed, {len(updated_mints)} updated"
+            f"Sync stats: {len(new_mints)} new, {len(removed_mints)} marked inactive, {len(updated_mints)} updated"
         )
 
         # Process in parallel
@@ -113,7 +114,7 @@ class DatabaseSyncService:
                 )
             )
 
-        # Remove old tokens
+        # Mark old tokens as inactive
         if removed_mints:
             tasks.append(self._remove_old_tokens_parallel(list(removed_mints)))
 
@@ -132,7 +133,7 @@ class DatabaseSyncService:
             stats = {
                 "sync_time_seconds": round(sync_time, 2),
                 "new_tokens": len(new_mints),
-                "removed_tokens": len(removed_mints),
+                "marked_inactive_tokens": len(removed_mints),
                 "updated_tokens": len(updated_mints),
                 "total_live_tokens": len(live_tokens_data),
                 "tokens_per_second": (
@@ -143,6 +144,12 @@ class DatabaseSyncService:
             logger.info(
                 f"Sync completed in {stats['sync_time_seconds']}s - {stats['tokens_per_second']} tokens/sec"
             )
+
+            # Fetch and update candle data for live tokens
+            try:
+                await self._update_candle_data_for_live_tokens()
+            except Exception as e:
+                logger.error(f"Error updating candle data: {e}")
 
             # Publish sync completed event so subscribers (SSE/websocket) can react immediately
             try:
@@ -252,6 +259,15 @@ class DatabaseSyncService:
                     # Prepare update data
                     update_data = self._prepare_update_data(token_data, market_activities)
                     
+                    # Handle live_since timestamp logic
+                    new_is_live = update_data.get("is_live", False)
+                    if new_is_live and not existing_token.is_live:
+                        # Token is becoming live, set live_since
+                        update_data["live_since"] = datetime.now()
+                    elif not new_is_live and existing_token.is_live:
+                        # Token is becoming inactive, reset live_since
+                        update_data["live_since"] = None
+                    
                     # Check if any fields actually changed
                     if self._has_changes(existing_token, update_data):
                         self.token_service.update_token(mint_address, update_data)
@@ -267,31 +283,72 @@ class DatabaseSyncService:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _remove_old_tokens_parallel(self, removed_mints: List[str]):
-        """Remove tokens that are no longer live"""
-        #logger.info("Removing %d old tokens", len(removed_mints))
+        """Mark tokens that are no longer live as inactive"""
+        #logger.info("Marking %d old tokens as inactive", len(removed_mints))
 
         if not removed_mints:
             return
 
         try:
-            # Use a single bulk DELETE for efficiency. synchronize_session=False is fine because
-            # we don't rely on ORM objects remaining in the session after delete.
-            deleted = (
+            # Use a single bulk UPDATE to set is_live=False for efficiency
+            updated = (
                 self.db.query(Token)
                 .filter(Token.mint_address.in_(removed_mints))
-                .delete(synchronize_session=False)
+                .update({"is_live": False, "live_since": None}, synchronize_session=False)
             )
             self.db.commit()
-            #logger.info("Bulk removed %d tokens", deleted)
+            #logger.info("Bulk marked %d tokens as inactive", updated)
         except Exception as e:
-            logger.exception("Bulk delete failed, falling back to per-mint deletes: %s", e)
-            # Fallback: delete individually (slower) using token_service to preserve existing behavior
+            logger.exception("Bulk update failed, falling back to per-mint updates: %s", e)
+            # Fallback: update individually (slower) using token_service to preserve existing behavior
             for mint in removed_mints:
                 try:
-                    self.token_service.delete_token(mint)
-                    logger.debug("Removed token: %s", mint)
+                    self.token_service.update_token(mint, {"is_live": False})
+                    logger.debug("Marked token as inactive: %s", mint)
                 except Exception as ex:
-                    logger.error("Error removing token %s: %s", mint, ex)
+                    logger.error("Error marking token %s as inactive: %s", mint, ex)
+
+    async def _update_candle_data_for_live_tokens(self):
+        """Fetch and update candle data for all live tokens"""
+        try:
+            # Get all live tokens
+            live_tokens = self.token_service.get_live_tokens()
+            if not live_tokens:
+                logger.debug("No live tokens found for candle data update")
+                return
+
+            logger.info(f"Updating candle data for {len(live_tokens)} live tokens")
+
+            # Create candle fetch service
+            candle_service = CandleFetchService()
+
+            try:
+                # Fetch candle data for all live tokens
+                candle_data_dict = await candle_service.fetch_candles_for_live_tokens(live_tokens)
+
+                # Ensure we have a dict (fetcher may return None on catastrophic failure)
+                if not candle_data_dict:
+                    logger.warning("Candle fetcher returned no data for any tokens")
+                    candle_data_dict = {}
+
+                # Update tokens with candle data
+                updated_count = 0
+                for token in live_tokens:
+                    mint_address = token.mint_address
+                    candle_data = candle_data_dict.get(mint_address)
+                    if candle_data is not None:
+                        # Persist even empty lists (if service returned []) or actual data
+                        self.token_service.update_token(mint_address, {"candle_data": candle_data})
+                        updated_count += 1
+
+                logger.info(f"Updated candle data for {updated_count}/{len(live_tokens)} live tokens")
+
+            finally:
+                await candle_service.close()
+
+        except Exception as e:
+            logger.error(f"Error in candle data update: {e}")
+            raise
 
     def _prepare_token_data(
         self, token_data: Dict[str, Any], market_activities: Dict[str, Any] = None
@@ -358,6 +415,8 @@ class DatabaseSyncService:
             # Status flags - handle nulls
             "is_live": token_data.get("is_currently_live", False) or False,
             "nsfw": token_data.get("nsfw", False) or False,
+            # Set live_since timestamp when token becomes live
+            "live_since": datetime.now() if (token_data.get("is_currently_live", False) or False) else None,
             # Optional fields
             "raydium_pool": token_data.get("raydium_pool"),
             "description": token_data.get("description"),
@@ -474,6 +533,7 @@ class DatabaseSyncService:
             "txns_6h",
             "txns_24h",
             "is_live",
+            "live_since",
             "reply_count",
             "last_reply",
             "last_trade_timestamp",

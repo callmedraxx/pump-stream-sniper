@@ -117,11 +117,15 @@ class Token(Base):
     # Raw data backup (for debugging and future compatibility)
     raw_data = Column(JSON, nullable=True)
 
+    # Candle data from pump.fun API
+    candle_data = Column(JSON, nullable=True)
+
     # Timestamps
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(
         DateTime, nullable=False, default=func.now(), onupdate=func.now()
     )
+    live_since = Column(DateTime, nullable=True)
 
     # Database indexes for fast sorting and querying
     __table_args__ = (

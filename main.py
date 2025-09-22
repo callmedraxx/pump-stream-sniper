@@ -1,12 +1,10 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
 import asyncio
 from contextlib import asynccontextmanager
 import os
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from src.services.stream import fetch_and_relay_livestreams, connected_clients
+from src.services.stream import fetch_and_relay_livestreams, fetch_and_relay_unified_trades, connected_clients
 from src.routes.stream import router as websocket_router
 from src.routes.live import router as live_router
 from src.routes.vibe import router as vibe_router
@@ -14,6 +12,8 @@ from src.services.fetch_live import poll_live_tokens
 from src.services.fetch_ath import start_background_loop, stop_background_loop
 from src.models import get_db, Token
 from src.models.database import create_tables
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(
@@ -30,6 +30,8 @@ load_dotenv('.env.local')   # Sensitive credentials
 
 # Global variables for background tasks
 live_tokens_task = None
+livestream_task = None
+unified_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -43,6 +45,12 @@ async def lifespan(app: FastAPI):
 
     print("📊 Starting live tokens polling...")
     live_tokens_task = asyncio.create_task(poll_live_tokens())
+
+    # Start WebSocket connections to pump.fun
+    print("🔗 Starting pump.fun WebSocket connections...")
+    livestream_task = asyncio.create_task(fetch_and_relay_livestreams(connected_clients))
+    unified_task = asyncio.create_task(fetch_and_relay_unified_trades(connected_clients))
+
     # Start ATH background loop (fetch ATH for complete==True every 60s)
     try:
         ath_task = start_background_loop(interval_seconds=60, batch_size=150, delay_between_batches=0.5)
@@ -66,6 +74,21 @@ async def lifespan(app: FastAPI):
             await live_tokens_task
         except asyncio.CancelledError:
             pass
+
+    # Stop WebSocket connections
+    if 'livestream_task' in locals():
+        livestream_task.cancel()
+        try:
+            await livestream_task
+        except asyncio.CancelledError:
+            pass
+    if 'unified_task' in locals():
+        unified_task.cancel()
+        try:
+            await unified_task
+        except asyncio.CancelledError:
+            pass
+
     # Stop ATH background loop if running
     try:
         await stop_background_loop()

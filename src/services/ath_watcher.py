@@ -65,13 +65,13 @@ async def run_once(batch_size: int = 50, delay: float = 1.0, full_refresh_hours:
             stats2 = await fetch_and_update_for_addresses(candidate_addresses, batch_size=batch_size, delay=delay)
             logger.info(f"ATH Watcher: refreshed candidate tokens: {stats2}")
 
-        # 3) Full refresh every N hours
+        # 3) Full refresh every N hours (only for live tokens)
         last_full = _read_last_full_refresh()
         now = datetime.utcnow()
         if (now - last_full) >= timedelta(hours=full_refresh_hours):
-            all_tokens = db.query(Token).all()
-            all_addresses = [t.mint_address for t in all_tokens]
-            logger.info(f"ATH Watcher: starting full refresh for {len(all_addresses)} tokens")
+            live_tokens = db.query(Token).filter(Token.is_live == True).all()
+            all_addresses = [t.mint_address for t in live_tokens]
+            logger.info(f"ATH Watcher: starting full refresh for {len(all_addresses)} live tokens")
 
             # Process in batches via ATHService
             stats3 = await fetch_and_update_for_addresses(all_addresses, batch_size=batch_size, delay=delay)

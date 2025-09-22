@@ -36,6 +36,11 @@ class TokenService:
                 return existing_token
 
             token = Token(**token_data)
+            
+            # Set live_since if token is live at creation
+            if token.is_live:
+                token.live_since = datetime.now()
+            
             self.db.add(token)
             self.db.commit()
             self.db.refresh(token)
@@ -65,6 +70,17 @@ class TokenService:
             if not token:
                 logger.warning(f"Token with mint {mint_address} not found for update")
                 return None
+
+            # Handle live_since timestamp based on is_live changes
+            if "is_live" in update_data:
+                current_is_live = token.is_live
+                new_is_live = update_data["is_live"]
+                if not current_is_live and new_is_live:
+                    # Token becoming live, set live_since to current time
+                    update_data["live_since"] = datetime.now()
+                elif current_is_live and not new_is_live:
+                    # Token becoming not live, reset live_since
+                    update_data["live_since"] = None
 
             # Update fields
             for key, value in update_data.items():
@@ -294,14 +310,17 @@ class TokenService:
             if not token:
                 return False
 
-            self.db.delete(token)
+            # Mark token as inactive instead of deleting to preserve history
+            token.is_live = False
+            token.live_since = None
+            token.updated_at = datetime.now()
             self.db.commit()
-            #logger.info(f"Deleted token: {mint_address}")
+            self.db.refresh(token)
             return True
 
         except Exception as e:
             self.db.rollback()
-            logger.error(f"Error deleting token {mint_address}: {e}")
+            logger.error(f"Error marking token {mint_address} as inactive: {e}")
             raise
 
     def bulk_create_tokens(self, tokens_data: List[Dict[str, Any]]) -> List[Token]:

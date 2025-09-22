@@ -486,12 +486,13 @@ async def run_loop(interval_seconds: int = 60, batch_size: int = 100, delay_betw
             # Query DB for tokens with complete == True
             db = next(get_db())
             try:
-                tokens = db.query(Token).all()
+                # Only fetch ATH for tokens that are currently live
+                tokens = db.query(Token).filter(Token.is_live == True).all()
                 if not tokens:
-                    logger.debug("No tokens found for ATH update")
+                    logger.debug("No live tokens found for ATH update")
                 else:
                     addresses = [t.mint_address for t in tokens]
-                    logger.info(f"Found {len(addresses)} tokens with  to update ATH")
+                    logger.info(f"Found {len(addresses)} live tokens to update ATH")
 
                     # Reuse DB session during this fetch so update_token_ath can reuse it
                     service.db = db
