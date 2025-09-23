@@ -33,7 +33,7 @@ async def _build_snapshot(db) -> Dict[str, Any]:
             "dev_activity": t.dev_activity,
             "created_coin_count": t.created_coin_count,
             "creator_balance_sol": t.creator_balance_sol,
-            "creator_balance_usd": t.creator_balance_usd,
+             "creator_balance_usd": t.creator_balance_usd,
             "creator": t.creator,
             "total_supply": t.total_supply,
             "pump_swap_pool": t.pump_swap_pool,
@@ -126,7 +126,7 @@ async def run_forever():
 
     async def _maybe_rebuild(source: str, payload: dict):
         """Rebuild the snapshot and publish if content changed."""
-        nonlocal _latest_snapshot
+        global _latest_snapshot
         logger.debug("sync_snapshot_service rebuilding snapshot due to %s", source)
         try:
             db = next(get_db())
@@ -162,10 +162,17 @@ async def run_forever():
                 pass
 
     try:
+        # Perform an initial build so subscribers connecting after startup can receive a snapshot
+        try:
+            await _maybe_rebuild("startup", {})
+        except Exception:
+            # don't let initial build failure stop the service; it'll rebuild on events
+            logger.exception("initial snapshot build failed")
+
         while True:
             # wait for either queue with small sleep resolution to be cooperative
             done, pending = await asyncio.wait(
-                [q_sync.get(), q_token.get()],
+                [asyncio.create_task(q_sync.get()), asyncio.create_task(q_token.get())],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 

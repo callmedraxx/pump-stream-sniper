@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -8,8 +9,11 @@ from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
 from ..models import Token, get_db
+from .event_broadcaster import broadcaster
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class TopHoldersService:
@@ -144,6 +148,25 @@ class TopHoldersService:
             token.creator_is_top_holder = creator_is_top_holder
 
             self.db.commit()
+            
+            # Publish token_updated event for real-time updates
+            try:
+                payload = {
+                    "type": "token_updated",
+                    "data": {
+                        "mint_address": token.mint_address,
+                        "creator_holding_percentage": token.creator_holding_percentage,
+                        "creator_is_top_holder": token.creator_is_top_holder,
+                        "creator_holding_amount": token.creator_holding_amount,
+                        "is_live": token.is_live,
+                        "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                    },
+                }
+                ok = broadcaster.schedule_publish("token_updated", payload)
+                if not ok:
+                    logger.warning("broadcaster.schedule_publish returned False for holders update %s", mint_address)
+            except Exception:
+                logger.exception("Failed to publish token_updated from fetch_top_holders for %s", mint_address)
 
             print(
                 f"✅ Updated holders for {token.symbol} ({mint_address[:8]}): "

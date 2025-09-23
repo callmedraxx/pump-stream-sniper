@@ -140,7 +140,7 @@ Use a reverse proxy (nginx, traefik) in front of multiple app instances for load
 1. **Port already in use**
    ```bash
    # Change port in .env
-   APP_PORT=8001
+   APP_PORT=8000
    ```
 
 2. **Database connection issues**

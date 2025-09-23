@@ -14,6 +14,7 @@ from src.services.creator_count_service import CreatorCountService
 from src.models import get_db, Token
 from src.models.database import create_tables
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 
 # Configure logging

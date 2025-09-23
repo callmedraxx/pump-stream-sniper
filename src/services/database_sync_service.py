@@ -341,6 +341,25 @@ class DatabaseSyncService:
             )
             self.db.commit()
             #logger.info("Bulk marked %d tokens as inactive", updated)
+            
+            # Publish bulk token_updated event for all tokens that became inactive
+            if updated > 0:
+                try:
+                    # For bulk updates, publish a single event indicating multiple tokens changed
+                    payload = {
+                        "type": "bulk_token_updated", 
+                        "data": {
+                            "mint_addresses": removed_mints,
+                            "update_type": "is_live_false",
+                            "count": updated,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        },
+                    }
+                    ok = broadcaster.schedule_publish("token_updated", payload)
+                    if not ok:
+                        logger.warning("broadcaster.schedule_publish returned False for bulk is_live update (%d tokens)", updated)
+                except Exception:
+                    logger.exception("Failed to publish bulk token_updated for is_live=False updates")
         except Exception as e:
             logger.exception("Bulk update failed, falling back to per-mint updates: %s", e)
             # Fallback: update individually (slower) using token_service to preserve existing behavior

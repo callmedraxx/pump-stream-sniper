@@ -1,8 +1,10 @@
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import and_, desc, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models import Token
@@ -43,7 +45,22 @@ class TokenService:
                 token.live_since = datetime.now()
             
             self.db.add(token)
-            self.db.commit()
+            try:
+                self.db.commit()
+            except IntegrityError as ie:
+                # Likely a race where another worker inserted the same mint concurrently.
+                # Rollback and return the existing token instead of failing the whole sync.
+                self.db.rollback()
+                logger.warning(
+                    "IntegrityError during create_token for %s, fetching existing token: %s",
+                    token_data.get("mint_address"), ie,
+                )
+                existing = self.get_token_by_mint(token_data.get("mint_address"))
+                if existing:
+                    return existing
+                # If no existing found, re-raise to surface unexpected errors
+                raise
+
             self.db.refresh(token)
             # Publish token created/updated event for subscribers (SSE/WebSocket)
             try:

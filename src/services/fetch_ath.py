@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..models import Token
 from ..models.database import get_db
+from .event_broadcaster import broadcaster
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +285,25 @@ class ATHService:
                 token.updated_at = datetime.utcnow()
                 
                 db.commit()
+                
+                # Publish token_updated event for real-time updates
+                try:
+                    payload = {
+                        "type": "token_updated",
+                        "data": {
+                            "mint_address": token.mint_address,
+                            "ath": token.ath,
+                            "progress": token.progress,
+                            "mcap": token.mcap,
+                            "is_live": token.is_live,
+                            "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                        },
+                    }
+                    ok = broadcaster.schedule_publish("token_updated", payload)
+                    if not ok:
+                        logger.warning("broadcaster.schedule_publish returned False for ATH update %s", mint_address)
+                except Exception:
+                    logger.exception("Failed to publish token_updated from update_token_ath for %s", mint_address)
                 
                 if ath_value is not None:
                     logger.debug(f"Updated ATH for {mint_address}: {old_ath} -> {new_ath_value}")

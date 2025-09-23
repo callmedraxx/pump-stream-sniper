@@ -43,3 +43,4 @@ grpcio==1.74.0
 grpcio-tools==1.74.0
 protobuf==6.32.1
 base58==2.1.1
+gunicorn==21.2.0

@@ -7,6 +7,7 @@ import aiohttp
 
 from src.models.database import SessionLocal
 from src.models.token import Token
+from .event_broadcaster import broadcaster
 
 logger = logging.getLogger(__name__)
 connected_clients = set()
@@ -22,6 +23,23 @@ def update_token_mcap(mint_address: str, market_cap: float):
             token.mcap = market_cap
             db.commit()
             #print(f"Updated mcap for {mint_address} to {market_cap}")
+            
+            # Publish token_updated event for real-time updates
+            try:
+                payload = {
+                    "type": "token_updated",
+                    "data": {
+                        "mint_address": token.mint_address,
+                        "mcap": token.mcap,
+                        "is_live": token.is_live,
+                        "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                    },
+                }
+                ok = broadcaster.schedule_publish("token_updated", payload)
+                if not ok:
+                    logger.warning("broadcaster.schedule_publish returned False for mcap update %s", mint_address)
+            except Exception:
+                logger.exception("Failed to publish token_updated from update_token_mcap for %s", mint_address)
         else:
             pass
     except Exception as e:
@@ -35,16 +53,42 @@ def update_token_ath_if_needed(mint_address: str, market_cap: float):
     db = SessionLocal()
     try:
         token = db.query(Token).filter(Token.mint_address == mint_address).first()
+        changed = False
         if token and token.ath > 0.0 and market_cap > token.ath:
             token.ath = market_cap
             token.progress = (market_cap / token.ath) * 100
             db.commit()
+            changed = True
             #print(f"Updated ATH for {mint_address} to {market_cap}, progress: {token.progress:.2f}%")
         elif token:
             # Always recalculate progress even if ATH not updated
+            old_progress = token.progress
             token.progress = (market_cap / token.ath) * 100 if token.ath > 0.0 else 0.0
-            db.commit()
+            if abs(old_progress - token.progress) > 0.01:  # Only commit if progress changed significantly
+                db.commit()
+                changed = True
             #print(f"Recalculated progress for {mint_address}: {token.progress:.2f}%")
+            
+        # Publish token_updated event if any field changed
+        if changed and token:
+            try:
+                payload = {
+                    "type": "token_updated",
+                    "data": {
+                        "mint_address": token.mint_address,
+                        "ath": token.ath,
+                        "progress": token.progress,
+                        "mcap": token.mcap,
+                        "is_live": token.is_live,
+                        "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                    },
+                }
+                ok = broadcaster.schedule_publish("token_updated", payload)
+                if not ok:
+                    logger.warning("broadcaster.schedule_publish returned False for ATH update %s", mint_address)
+            except Exception:
+                logger.exception("Failed to publish token_updated from update_token_ath_if_needed for %s", mint_address)
+                
     except Exception as e:
         print(f"Error updating token ATH/progress: {e}")
     finally:
@@ -97,6 +141,25 @@ def update_token_dev_activity(mint_address: str, user_address: str, trade: dict)
 
                 db.commit()
                 logger.info(f"Updated dev_activity for {mint_address}: {dev_obj}")
+                # Publish a token_updated event so subscribers (WS/SSE) can react
+                try:
+                    payload = {
+                        "type": "token_updated",
+                        "data": {
+                            "mint_address": token.mint_address,
+                            "dev_activity": token.dev_activity,
+                            "creator_balance_sol": token.creator_balance_sol,
+                            "creator_balance_usd": token.creator_balance_usd,
+                            "is_live": token.is_live,
+                            "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                        },
+                    }
+                    # Use broadcaster.schedule_publish which is safe to call from threads
+                    ok = broadcaster.schedule_publish("token_updated", payload)
+                    if not ok:
+                        logger.warning("broadcaster.schedule_publish returned False for %s", mint_address)
+                except Exception:
+                    logger.exception("Failed to publish token_updated from stream.update_token_dev_activity for %s", mint_address)
     except Exception as e:
         print(f"Error updating dev_activity for {mint_address}: {e}")
     finally:

@@ -1,8 +1,9 @@
 module.exports = {
   apps: [{
     name: 'pump-stream-sniper-docker',
-    script: 'docker',
-    args: 'compose up',
+  // Run docker compose via a shell so `pm2 start` simply executes the compose command
+  script: 'sh',
+  args: '-c "docker compose up"',
     cwd: '/root/pump-stream-sniper',
     instances: 1,
     exec_mode: 'fork',

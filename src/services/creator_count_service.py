@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from src.models import Token
 from src.models.database import SessionLocal
 from .fetch_activities import fetch_creator_created_count, fetch_creator_created_counts
+from .event_broadcaster import broadcaster
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +71,29 @@ class CreatorCountService:
 
                 for token in creator_map.get(creator, []):
                     try:
+                        old_count = token.created_coin_count
                         token.created_coin_count = count_int
                         self.db.commit()
                         #logger.info(f"Refreshed created_coin_count for {token.mint_address}: {count_int}")
+                        
+                        # Publish token_updated event if count changed
+                        if old_count != count_int:
+                            try:
+                                payload = {
+                                    "type": "token_updated",
+                                    "data": {
+                                        "mint_address": token.mint_address,
+                                        "created_coin_count": token.created_coin_count,
+                                        "is_live": token.is_live,
+                                        "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                                    },
+                                }
+                                ok = broadcaster.schedule_publish("token_updated", payload)
+                                if not ok:
+                                    logger.warning("broadcaster.schedule_publish returned False for creator count update %s", token.mint_address)
+                            except Exception:
+                                logger.exception("Failed to publish token_updated from creator_count_service for %s", token.mint_address)
+                                
                     except Exception as e:
                         logger.warning(f"Failed to update DB for {token.mint_address}: {e}")
 
@@ -95,9 +116,29 @@ class CreatorCountService:
             try:
                 token = self.db.query(Token).filter(Token.mint_address == mint_address).first()
                 if token:
+                    old_count = token.created_coin_count
                     token.created_coin_count = int(count_int)
                     self.db.commit()
                     #logger.info(f"Refreshed created_coin_count for {mint_address}: {count_int}")
+                    
+                    # Publish token_updated event if count changed
+                    if old_count != count_int:
+                        try:
+                            payload = {
+                                "type": "token_updated",
+                                "data": {
+                                    "mint_address": token.mint_address,
+                                    "created_coin_count": token.created_coin_count,
+                                    "is_live": token.is_live,
+                                    "updated_at": token.updated_at.isoformat() if token.updated_at else None,
+                                },
+                            }
+                            ok = broadcaster.schedule_publish("token_updated", payload)
+                            if not ok:
+                                logger.warning("broadcaster.schedule_publish returned False for creator count update %s", mint_address)
+                        except Exception:
+                            logger.exception("Failed to publish token_updated from creator_count_service for %s", mint_address)
+                            
             except Exception as e:
                 logger.warning(f"Failed to update DB for {mint_address}: {e}")
         except Exception as e:

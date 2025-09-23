@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import aiohttp
 from dotenv import load_dotenv
 from fastapi import HTTPException
+import time
 
 load_dotenv()
 
@@ -536,6 +537,8 @@ async def fetch_creator_created_counts(
 
     results = {}
     sem = asyncio.Semaphore(concurrency)
+    # Shared timestamp (epoch seconds) until which we should back off globally
+    rate_limit_until = 0.0
 
     async def _fetch_with_retries(session, creator):
         url = (
@@ -557,8 +560,15 @@ async def fetch_creator_created_counts(
             "Priority": "u=1, i",
         }
 
+        nonlocal rate_limit_until
         attempt = 0
         while attempt <= max_retries:
+            # If a recent global rate-limit was triggered, wait until it expires
+            now = time.time()
+            if now < rate_limit_until:
+                to_wait = rate_limit_until - now
+                logger.debug(f"Global rate-limit active, waiting {to_wait:.1f}s before requesting {creator}")
+                await asyncio.sleep(to_wait)
             try:
                 async with sem:
                     async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
@@ -571,11 +581,12 @@ async def fetch_creator_created_counts(
                                 logger.warning(f"Failed parsing created-count for {creator}: {e}")
                                 return 0
                         elif resp.status == 429:
-                            # Rate limited — backoff and retry
+                            # Rate limited — set a global backoff window so other tasks pause too
                             attempt += 1
-                            backoff = base_backoff * (2 ** (attempt - 1))
-                            logger.debug(f"429 for {creator}, retrying in {backoff}s (attempt {attempt})")
-                            await asyncio.sleep(backoff)
+                            # set global rate limit to 50 seconds from now
+                            rate_limit_until = time.time() + 50
+                            logger.warning(f"429 for {creator}: entering global backoff for 50s (attempt {attempt})")
+                            await asyncio.sleep(50)
                             continue
                         else:
                             logger.warning(f"Created-count API returned {resp.status} for {creator}")
