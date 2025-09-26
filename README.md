@@ -44,10 +44,7 @@ docker-compose -f docker-compose.prod.yml up --build -d
 | `ENVIRONMENT` | Environment mode (`development` or `production`) | `development` |
 | `APP_PORT` | Application port | `8000` |
 | `LOG_LEVEL` | Logging level | `info` |
-| `POSTGRES_DB` | PostgreSQL database name | `pumpfun_db` |
-| `POSTGRES_USER` | PostgreSQL username | `pumpfun_user` |
-| `POSTGRES_PASSWORD` | PostgreSQL password | `pumpfun_password` |
-| `POSTGRES_PORT` | PostgreSQL port | `5432` |
+| `DATABASE_URL` | Supabase PostgreSQL connection URL | Required |
 | `REDIS_PORT` | Redis port | `6379` |
 | `COOKIE` | pump.fun authentication cookie | Required |
 | `USERNAME` | pump.fun username | Required |

@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
 from ..models import get_db
+from ..models.database import SessionLocal
 from .database_sync_service import DatabaseSyncService
 from .event_broadcaster import broadcaster
 
@@ -67,9 +68,9 @@ async def poll_live_tokens():
     async with aiohttp.ClientSession() as session:
         while True:
             # Create fresh database session and sync service for each polling cycle
-            db = next(get_db())
+            db = SessionLocal()
             sync_service = DatabaseSyncService(
-                db, max_workers=15  # Balanced concurrency for performance and stability
+                db, max_workers=5  # Balanced concurrency for performance and stability
             )
 
             try:

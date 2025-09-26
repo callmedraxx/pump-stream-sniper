@@ -69,10 +69,11 @@ class Broadcaster:
         """Publish payload to all subscribers (non-blocking)."""
         async with self._lock:
             queues = list(self._subs.get(event_name, []))
-        try:
-            logger.info("publishing event '%s' to %d subscribers", event_name, len(queues))
-        except Exception:
-            pass
+        # try:
+            
+        #     #logger.info("publishing event '%s' to %d subscribers", event_name, len(queues))
+        # except Exception:
+        #     pass
         for q in queues:
             # Use put_nowait to avoid slow subscribers blocking publisher
             try:

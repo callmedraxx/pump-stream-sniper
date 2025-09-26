@@ -6,8 +6,35 @@ from typing import Dict, List, Optional
 import aiohttp
 
 from ..models import Token
+from ..models.database import SessionLocal, DB_CONNECTION_SEMAPHORE
 
 logger = logging.getLogger(__name__)
+
+
+# In-memory cache for candle data shared across workers in the process
+_CANDLE_CACHE: dict = {}
+_CANDLE_CACHE_LOCK: asyncio.Lock | None = None
+
+
+def _ensure_cache_lock():
+    global _CANDLE_CACHE_LOCK
+    if _CANDLE_CACHE_LOCK is None:
+        _CANDLE_CACHE_LOCK = asyncio.Lock()
+
+
+async def set_candle_cache(mint: str, data: Optional[List[Dict]]):
+    _ensure_cache_lock()
+    async with _CANDLE_CACHE_LOCK:
+        if data is None:
+            _CANDLE_CACHE.pop(mint, None)
+        else:
+            _CANDLE_CACHE[mint] = data
+
+
+async def get_candle_cache(mint: str) -> Optional[List[Dict]]:
+    _ensure_cache_lock()
+    async with _CANDLE_CACHE_LOCK:
+        return _CANDLE_CACHE.get(mint)
 
 
 class CandleFetchService:
@@ -21,7 +48,7 @@ class CandleFetchService:
         self._last_request = 0.0
         self._rate_lock = asyncio.Lock()
 
-    async def fetch_candle_data(self, mint_address: str, interval: str = "1m", limit: int = 120) -> Optional[List[Dict]]:
+    async def fetch_candle_data(self, mint_address: str, interval: str = "1h", limit: int = 120) -> Optional[List[Dict]]:
         """
         Fetch candle data for a specific token
 
@@ -102,7 +129,7 @@ class CandleFetchService:
         logger.error(f"Exhausted retries fetching candles for {mint_address}")
         return None
 
-    async def fetch_candles_for_live_tokens(self, tokens: List[Token], interval: str = "1m", limit: int = 120) -> Dict[str, List[Dict]]:
+    async def fetch_candles_for_live_tokens(self, tokens: List[Token], interval: str = "1h", limit: int = 120) -> Dict[str, List[Dict]]:
         """
         Fetch candle data for all live tokens
 
@@ -153,6 +180,127 @@ class CandleFetchService:
 
         logger.info(f"Successfully fetched candle data for {successful_fetches}/{len(live_tokens)} tokens")
         return candle_data_dict
+
+    # --- Background runner -------------------------------------------------
+    # Note: per-token DB writes removed. We collect fetched candle data into a
+    # local cache and perform bulk writes in batches using a single DB session
+    # per batch to avoid exhausting the DB connection pool.
+
+    async def run_loop(self, interval_seconds: int = 60, limit: int = 120, concurrency: int = 10):
+        """
+        Periodically fetch candle data for live tokens and persist to DB.
+
+        - Queries the DB each iteration so newly-added tokens are picked up.
+        - Runs every `interval_seconds` (default 60s).
+        - Uses an HTTP semaphore for concurrent requests and a DB semaphore
+          to avoid exceeding the DB connection pool.
+        """
+        self.requests_per_second = max(self.requests_per_second, 1)
+        http_semaphore = asyncio.Semaphore(concurrency)
+
+        async def _fetch_for_token(token: Token):
+            async with http_semaphore:
+                try:
+                    return token.mint_address, await self.fetch_candle_data(token.mint_address, "1h", limit)
+                except Exception as e:
+                    logger.exception("Error fetching candles for %s: %s", token.mint_address, e)
+                    return token.mint_address, None
+
+        logger.info("Starting CandleFetchService run loop (interval=%ss)", interval_seconds)
+        while True:
+            try:
+                # Query DB for live tokens (fresh each loop to pick up new tokens)
+                db = SessionLocal()
+                try:
+                    tokens = db.query(Token).filter(Token.is_live == True).all()
+                finally:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+
+                if not tokens:
+                    logger.debug("No live tokens found for candle fetch; sleeping")
+                    await asyncio.sleep(interval_seconds)
+                    continue
+
+                # Throttle concurrent HTTP fetches via the local semaphore
+                tasks = [_fetch_for_token(t) for t in tokens]
+                results = []
+                # Execute in reasonably-sized batches to avoid huge spikes
+                batch_size = max(10, concurrency)
+                for i in range(0, len(tasks), batch_size):
+                    slice_tasks = tasks[i : i + batch_size]
+                    res = await asyncio.gather(*slice_tasks, return_exceptions=True)
+                    results.extend(res)
+
+                # Build list of successful fetches and update local cache
+                updates: list[tuple[str, List[Dict]]] = []
+                for item in results:
+                    if isinstance(item, Exception):
+                        logger.debug("Exception in fetch results: %s", item)
+                        continue
+                    mint, candles = item
+                    if not candles:
+                        logger.debug("No candles for %s", mint)
+                        continue
+                    # Store in local in-memory cache for other workers
+                    try:
+                        await set_candle_cache(mint, candles)
+                    except Exception:
+                        logger.exception("Failed to set candle cache for %s", mint)
+                    updates.append((mint, candles))
+
+                # Bulk write updates in chunks using one DB session per chunk
+                if updates:
+                    # chunk to reasonable size to avoid huge SQL statements / mem usage
+                    WRITE_CHUNK = 200
+
+                    def _do_bulk_write(batch: list[tuple[str, List[Dict]]]) -> int:
+                        db = SessionLocal()
+                        try:
+                            mint_list = [m for m, _ in batch]
+                            rows = db.query(Token).filter(Token.mint_address.in_(mint_list)).all()
+                            token_map = {r.mint_address: r for r in rows}
+                            applied = 0
+                            for m, candles in batch:
+                                t = token_map.get(m)
+                                if not t:
+                                    continue
+                                t.candle_data = candles
+                                applied += 1
+                            if applied:
+                                db.commit()
+                            return applied
+                        except Exception:
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+                            logger.exception("Exception during bulk candle write")
+                            return 0
+                        finally:
+                            try:
+                                db.close()
+                            except Exception:
+                                pass
+
+                    # execute chunks, gating DB concurrency with semaphore
+                    for i in range(0, len(updates), WRITE_CHUNK):
+                        chunk = updates[i : i + WRITE_CHUNK]
+                        try:
+                            async with DB_CONNECTION_SEMAPHORE:
+                                applied = await asyncio.to_thread(_do_bulk_write, chunk)
+                                logger.info("Bulk wrote %d candles (chunk %d/%d)", applied, i // WRITE_CHUNK + 1, (len(updates) + WRITE_CHUNK - 1) // WRITE_CHUNK)
+                        except Exception:
+                            logger.exception("Error during bulk candle chunk write starting at %d", i)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Unexpected error in CandleFetchService run loop")
+
+            await asyncio.sleep(interval_seconds)
 
     async def close(self):
         """Close the HTTP session"""

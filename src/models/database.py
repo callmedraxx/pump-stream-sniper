@@ -11,18 +11,53 @@ from .token import Base
 load_dotenv()
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/db")
+DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL") or os.getenv("DATABASE_URL")
+
+# Fail fast with helpful message when DATABASE_URL isn't provided or is empty.
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Set SUPABASE_HOST (and POSTGRES_*) or provide a full DATABASE_URL in the environment."
+    )
+
+connect_args = {}
+if "sslmode=require" in DATABASE_URL or "sslmode=prefer" in DATABASE_URL:
+    connect_args["sslmode"] = "require"
+
+# Allow tuning pool size via environment to match Supabase limits.
+# Use conservative defaults to avoid exhausting provider-side pool limits when
+# multiple worker processes are used. You can override via env when needed.
+DEFAULT_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "40"))
+# Allow configuring max_overflow via env, but default to a small value to
+# avoid exhausting provider-side session limits when many worker processes
+# are used. Operators can increase this deliberately if they understand
+# the provider's pool semantics.
+DEFAULT_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "5"))
+DEFAULT_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+DEFAULT_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "3600"))
 
 # Create engine with connection pooling
-engine = create_engine(
-    DATABASE_URL,
-    poolclass=QueuePool,
-    pool_size=20,  # Increased from 10 to handle more concurrent connections
-    max_overflow=30,  # Increased from 20 to provide more flexibility
-    pool_timeout=60,  # Increased timeout from 30 to 60 seconds
-    pool_recycle=3600,  # Recycle connections after 1 hour
-    echo=False,  # Set to True for SQL query logging in development
-)
+try:
+    engine = create_engine(
+        DATABASE_URL,
+        poolclass=QueuePool,
+        pool_size=DEFAULT_POOL_SIZE,
+        max_overflow=DEFAULT_MAX_OVERFLOW,
+        pool_timeout=DEFAULT_POOL_TIMEOUT,
+        pool_recycle=DEFAULT_POOL_RECYCLE,
+        # Protect against stale connections
+        pool_pre_ping=True,
+        echo=False,
+        # Always pass a dict (can be empty).
+        connect_args=connect_args,
+    )
+except Exception as e:
+    raise RuntimeError(f"Failed to create DB engine from DATABASE_URL: {e}") from e
+
+# Semaphore to limit concurrent DB-using threads/tasks inside this process.
+# Use a semaphore sized to pool_size so that we don't create more simultaneous
+# DB sessions/threads than the DB server accepts.
+from asyncio import Semaphore
+DB_CONNECTION_SEMAPHORE = Semaphore(DEFAULT_POOL_SIZE)
 
 # Create SessionLocal class
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -49,13 +84,112 @@ def get_connection_pool_status():
     Useful for monitoring and debugging connection issues
     """
     pool = engine.pool
+    # Probe safely - QueuePool exposes these methods but be defensive
+    try:
+        size = pool.size()
+    except Exception:
+        size = None
+    try:
+        checkedin = pool.checkedin()
+    except Exception:
+        checkedin = None
+    try:
+        checkedout = pool.checkedout()
+    except Exception:
+        checkedout = None
+    try:
+        overflow = pool.overflow()
+    except Exception:
+        overflow = None
+    # 'invalid' may not be present; if missing, approximate it non-negatively
+    try:
+        invalid = pool.invalid()
+    except Exception:
+        if None not in (size, checkedin, checkedout):
+            # invalid ~= size - (checkedin + checkedout)
+            try:
+                invalid = max(0, (size or 0) - (checkedin or 0) - (checkedout or 0))
+            except Exception:
+                invalid = None
+        else:
+            invalid = None
+
+    # Normalize overflow/invalid to avoid negative confusing values in logs
+    try:
+        if overflow is not None and isinstance(overflow, int) and overflow < 0:
+            overflow = 0
+    except Exception:
+        pass
+    try:
+        if invalid is not None and isinstance(invalid, int) and invalid < 0:
+            invalid = 0
+    except Exception:
+        pass
+
     return {
-        "pool_size": pool.size(),
-        "checkedin": pool.checkedin(),
-        "checkedout": pool.checkedout(),
-        "overflow": pool.overflow(),
-        "invalid": pool.invalid(),
+        "pool_size": size,
+        "checkedin": checkedin,
+        "checkedout": checkedout,
+        "overflow": overflow,
+        "invalid": invalid,
     }
+
+
+def log_pool_status(logger, context: str = ""):
+    """Log a concise snapshot of the connection pool state with context."""
+    try:
+        pool = engine.pool
+        # Probe common pool metrics safely; some pool implementations expose
+        # methods with different names or omit specific metrics.
+        def _call_if_callable(obj, name):
+            try:
+                attr = getattr(obj, name)
+            except Exception:
+                return "N/A"
+            try:
+                return attr() if callable(attr) else attr
+            except Exception:
+                return "N/A"
+
+        size = _call_if_callable(pool, "size")
+        checkedout = _call_if_callable(pool, "checkedout")
+        checkedin = _call_if_callable(pool, "checkedin")
+        overflow = _call_if_callable(pool, "overflow")
+        # 'invalid' isn't guaranteed; try 'invalid' then fallback to computation
+        invalid = _call_if_callable(pool, "invalid")
+        if invalid == "N/A":
+            try:
+                invalid = max(0, (size or 0) - (checkedin or 0) - (checkedout or 0))
+            except Exception:
+                invalid = "N/A"
+
+        # Normalize negative values which can appear due to timing/race windows
+        try:
+            if isinstance(overflow, int) and overflow < 0:
+                overflow = 0
+        except Exception:
+            pass
+        try:
+            if isinstance(invalid, int) and invalid < 0:
+                invalid = 0
+        except Exception:
+            pass
+
+        logger.info(
+            "DB Pool Status%s: size=%s checkedout=%s checkedin=%s overflow=%s invalid=%s",
+            (f' [{context}]' if context else ''),
+            size,
+            checkedout,
+            checkedin,
+            overflow,
+            invalid,
+        )
+    except Exception as e:
+        # Don't raise from logging helper; report and continue
+        try:
+            logger.warning("Failed to read DB pool status: %s", e)
+        except Exception:
+            print(f"Failed to read DB pool status: {e}")
 
 
 def create_tables():

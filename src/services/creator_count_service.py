@@ -19,10 +19,14 @@ class CreatorCountService:
     It updates tokens in batches with a small concurrency limit.
     """
 
-    def __init__(self, db: Session = None, batch_size: int = 50, interval_seconds: int = 600):
-        self.db = db or SessionLocal()
+    def __init__(self, db: Session = None, batch_size: int = 20, interval_seconds: int = 600, api_delay_seconds: float = 1):
+        # Do NOT keep a long-lived SessionLocal() instance. Create sessions per
+        # operation to avoid holding connections open for long periods.
+        self._provided_db = db  # optional externally-provided session (for testing)
         self.batch_size = batch_size
         self.interval_seconds = interval_seconds
+    # Delay between batch API calls to avoid rate limits. Can be increased; okay to take minutes.
+        self.api_delay_seconds = api_delay_seconds
         self._running = False
 
     async def run_loop(self):
@@ -35,12 +39,21 @@ class CreatorCountService:
             await asyncio.sleep(self.interval_seconds)
 
     async def refresh_all_tokens(self):
-        # Get all tokens to update created_coin_count
-        tokens = self.db.query(Token).all()
+        # Get all tokens to update created_coin_count. Open a short-lived session to fetch tokens.
+        db = self._provided_db or SessionLocal()
+        try:
+            tokens = db.query(Token).all()
+        finally:
+            if self._provided_db is None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
         if not tokens:
             return
 
-        logger.info(f"Refreshing created_coin_count for {len(tokens)} tokens in batches of {self.batch_size}")
+        logger.info(f"Refreshing created_coin_count for {len(tokens)} tokens for {len(set([t.creator for t in tokens if t.creator]))} creators")
 
         # Group tokens by creator to minimize API calls
         creator_map = {}
@@ -49,100 +62,94 @@ class CreatorCountService:
                 continue
             creator_map.setdefault(t.creator, []).append(t)
 
-        # Process creators in chunks to avoid overwhelming API
         creators = list(creator_map.keys())
+
+        # Fetch counts for all creators in batches, spacing requests to avoid rate limits.
+        all_counts = {}
         for i in range(0, len(creators), self.batch_size):
             chunk = creators[i : i + self.batch_size]
             try:
-                counts = await fetch_creator_created_counts(chunk, concurrency=4, max_retries=3)
+                # Prefer batch fetch for speed, but still respect spacing between batches
+                chunk_counts = await fetch_creator_created_counts(chunk, concurrency=4, max_retries=3)
             except Exception as e:
-                logger.error(f"Batch fetch created counts failed for chunk starting at {i}: {e}")
-                counts = {c: 0 for c in chunk}
+                logger.warning(f"Batch fetch created counts failed for chunk starting at {i}: {e}")
+                # Fallback to sequential fetch for each creator in the chunk to be robust and spaced
+                chunk_counts = {}
+                for creator in chunk:
+                    try:
+                        c = await fetch_creator_created_count(creator)
+                    except Exception as ee:
+                        logger.warning(f"Failed to fetch created count for creator {creator}: {ee}")
+                        c = 0
+                    chunk_counts[creator] = c or 0
 
-            # Apply results to tokens
-            for creator in chunk:
-                count = counts.get(creator, 0)
+            # Normalize and store counts
+            for creator, raw_count in (chunk_counts or {}).items():
                 try:
-                    count_int = int(count or 0)
+                    count_int = int(raw_count or 0)
                 except Exception:
                     count_int = 0
                 if count_int <= 0:
                     count_int = 1
+                all_counts[creator] = count_int
 
-                for token in creator_map.get(creator, []):
-                    try:
-                        old_count = token.created_coin_count
-                        token.created_coin_count = count_int
-                        self.db.commit()
-                        #logger.info(f"Refreshed created_coin_count for {token.mint_address}: {count_int}")
-                        
-                        # Publish token_updated event if count changed
-                        if old_count != count_int:
-                            try:
-                                payload = {
-                                    "type": "token_updated",
-                                    "data": {
-                                        "mint_address": token.mint_address,
-                                        "created_coin_count": token.created_coin_count,
-                                        "is_live": token.is_live,
-                                        "updated_at": token.updated_at.isoformat() if token.updated_at else None,
-                                    },
-                                }
-                                ok = broadcaster.schedule_publish("token_updated", payload)
-                                if not ok:
-                                    logger.warning("broadcaster.schedule_publish returned False for creator count update %s", token.mint_address)
-                            except Exception:
-                                logger.exception("Failed to publish token_updated from creator_count_service for %s", token.mint_address)
-                                
-                    except Exception as e:
-                        logger.warning(f"Failed to update DB for {token.mint_address}: {e}")
+            # Respect delay between API batch calls to avoid rate limiting
+            try:
+                await asyncio.sleep(self.api_delay_seconds)
+            except Exception:
+                pass
 
-    async def _update_token_created_count(self, mint_address: str, creator_address: str):
+        if not all_counts:
+            logger.info("No creator counts fetched; skipping DB update")
+            return
+
+        # Now update ALL tokens in a single DB session/transaction
+        db2 = self._provided_db or SessionLocal()
         try:
-            count = await fetch_creator_created_count(creator_address)
-            if count is None:
+            # Fetch tokens that have creators in our map (one query)
+            tokens_to_update = db2.query(Token).filter(Token.creator.in_(list(all_counts.keys()))).all()
+            if not tokens_to_update:
+                logger.info("No tokens found to update in DB for fetched creators")
                 return
 
-            # Enforce business rule: created_coin_count cannot be None or 0
-            try:
-                count_int = int(count or 0)
-            except Exception:
-                count_int = 0
+            updated = 0
+            for t in tokens_to_update:
+                new_count = all_counts.get(t.creator)
+                if new_count is None:
+                    continue
+                # Only update if different to reduce dirty work
+                try:
+                    if t.created_coin_count != new_count:
+                        t.created_coin_count = new_count
+                        updated += 1
+                except Exception:
+                    # In case of unexpected types
+                    try:
+                        t.created_coin_count = int(new_count)
+                        updated += 1
+                    except Exception:
+                        logger.debug(f"Could not set created_coin_count for token id {t.id}")
 
-            if count_int <= 0:
-                count_int = 1
-
-            # Update DB record
             try:
-                token = self.db.query(Token).filter(Token.mint_address == mint_address).first()
-                if token:
-                    old_count = token.created_coin_count
-                    token.created_coin_count = int(count_int)
-                    self.db.commit()
-                    #logger.info(f"Refreshed created_coin_count for {mint_address}: {count_int}")
-                    
-                    # Publish token_updated event if count changed
-                    if old_count != count_int:
-                        try:
-                            payload = {
-                                "type": "token_updated",
-                                "data": {
-                                    "mint_address": token.mint_address,
-                                    "created_coin_count": token.created_coin_count,
-                                    "is_live": token.is_live,
-                                    "updated_at": token.updated_at.isoformat() if token.updated_at else None,
-                                },
-                            }
-                            ok = broadcaster.schedule_publish("token_updated", payload)
-                            if not ok:
-                                logger.warning("broadcaster.schedule_publish returned False for creator count update %s", mint_address)
-                        except Exception:
-                            logger.exception("Failed to publish token_updated from creator_count_service for %s", mint_address)
-                            
+                db2.commit()
             except Exception as e:
-                logger.warning(f"Failed to update DB for {mint_address}: {e}")
+                logger.warning(f"Failed to commit created_coin_count updates for all creators: {e}")
+                try:
+                    db2.rollback()
+                except Exception:
+                    pass
+            else:
+                logger.info(f"Committed created_coin_count updates for {updated} tokens")
         except Exception as e:
-            logger.error(f"Error fetching created count for {creator_address}: {e}")
+            logger.warning(f"Failed to apply created_coin_count updates in single transaction: {e}")
+        finally:
+            if self._provided_db is None:
+                try:
+                    db2.close()
+                except Exception:
+                    pass
+
+    # per-token update method removed: we now fetch all creators and update all tokens in a single transaction
 
     def stop(self):
         self._running = False

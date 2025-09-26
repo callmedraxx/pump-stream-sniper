@@ -16,6 +16,29 @@ logger = logging.getLogger(__name__)
 # The batch endpoint accepts at most 50 addresses per request (observed from API)
 MAX_BATCH_SIZE = 50
 
+# Throttling state for creator balance API calls (global per-process)
+_balance_throttle_lock: asyncio.Lock | None = None
+_last_balance_request_time: float = 0.0
+
+
+def _ensure_balance_lock():
+    global _balance_throttle_lock
+    if _balance_throttle_lock is None:
+        _balance_throttle_lock = asyncio.Lock()
+
+
+async def _throttle_balance_request(min_interval: float = 1.0):
+    """Ensure at least `min_interval` seconds between balance API requests per process."""
+    global _last_balance_request_time
+    _ensure_balance_lock()
+    async with _balance_throttle_lock:
+        now = asyncio.get_event_loop().time()
+        elapsed = now - _last_balance_request_time
+        to_wait = min_interval - elapsed
+        if to_wait and to_wait > 0:
+            await asyncio.sleep(to_wait)
+        _last_balance_request_time = asyncio.get_event_loop().time()
+
 
 async def fetch_market_activities(pool_address: str) -> Dict:
     """
@@ -225,7 +248,7 @@ async def fetch_market_activities_batch(addresses: List[str]) -> Dict[str, Dict]
                 url, 
                 headers=headers, 
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 
                 if response.status == 200 or response.status == 201:
@@ -618,7 +641,7 @@ async def fetch_creator_created_counts(
 
     return results
 
-async def fetch_creator_balance_for_mint(creator_address: str, target_mint: str, page: int = 1, limit: int = 1000) -> dict:
+async def fetch_creator_balance_for_mint(creator_address: str, target_mint: str, page: int = 1, limit: int = 1000, session: aiohttp.ClientSession = None) -> dict:
     """
     Fetch wallet balances for creator and return the balance and balanceUSD for target_mint.
 
@@ -646,8 +669,18 @@ async def fetch_creator_balance_for_mint(creator_address: str, target_mint: str,
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        # Respect per-request throttling (1s between calls)
+        try:
+            await _throttle_balance_request(min_interval=1.0)
+        except Exception:
+            pass
+
+        close_session = False
+        if session is None:
+            session = aiohttp.ClientSession()
+            close_session = True
+
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status in (200, 201):
                     try:
                         data = await resp.json()
@@ -667,7 +700,56 @@ async def fetch_creator_balance_for_mint(creator_address: str, target_mint: str,
                     return {}
     except Exception as e:
         logger.error(f"Network error fetching wallet balances for {creator_address}: {e}")
+        try:
+            if close_session:
+                await session.close()
+        except Exception:
+            pass
         return {}
+    finally:
+        try:
+            if 'close_session' in locals() and close_session:
+                await session.close()
+        except Exception:
+            pass
+
+
+async def fetch_creator_balances_for_mints(creator_addresses: List[str], target_mint: str, *, batch_size: int = 10, batch_interval: float = 1.5) -> Dict[str, dict]:
+    """
+    Fetch balances for multiple creator addresses. Splits the list into batches (up to batch_size creators per batch),
+    ensures at least 1 second between individual API calls and waits `batch_interval` seconds between batches.
+
+    Returns a mapping creator_address -> balance dict (or {} if not found).
+    """
+    if not creator_addresses:
+        return {}
+
+    results: Dict[str, dict] = {}
+
+    # Limit batch size to at most 10 (or provided), but never exceed a safe upper bound
+    batch_size = max(1, min(batch_size, 10))
+
+    async with aiohttp.ClientSession() as session:
+        for i in range(0, len(creator_addresses), batch_size):
+            batch = creator_addresses[i : i + batch_size]
+            # Within the batch, perform sequential requests to avoid parallel hammering
+            for creator in batch:
+                try:
+                    res = await fetch_creator_balance_for_mint(creator, target_mint, session=session)
+                    results[creator] = res or {}
+                except Exception as e:
+                    logger.exception(f"Error fetching balance for creator {creator}: {e}")
+                    results[creator] = {}
+
+            # If there are more batches to process, wait between batches to reduce rate-limit risk
+            if i + batch_size < len(creator_addresses):
+                # Sleep at least batch_interval seconds (1-2s recommended)
+                try:
+                    await asyncio.sleep(batch_interval)
+                except Exception:
+                    pass
+
+    return results
 
 
 # Backward compatibility: make the old function use the new batch method for better reliability

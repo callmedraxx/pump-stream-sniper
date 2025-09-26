@@ -7,7 +7,7 @@ from typing import List
 
 from .fetch_ath import ATHService
 from ..models import Token
-from ..models.database import get_db
+from ..models.database import get_db, SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ async def fetch_and_update_for_addresses(addresses: List[str], batch_size: int =
 
 async def run_once(batch_size: int = 50, delay: float = 1.0, full_refresh_hours: int = 24):
     start = time.time()
-    db = next(get_db())
+    db = SessionLocal()
 
     try:
         # Only fetch ATH for new tokens (ath == 0.0) - one-time setup

@@ -39,7 +39,7 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
 
 # Run the application with gunicorn (uvicorn worker) in production, uvicorn in development
 CMD if [ "$ENVIRONMENT" = "production" ]; then \
-        exec gunicorn main:app -k uvicorn.workers.UvicornWorker --workers 1 --bind 0.0.0.0:8000 --timeout 120; \
+        exec gunicorn main:app -k uvicorn.workers.UvicornWorker --workers 5 --bind 0.0.0.0:8000 --timeout 360; \
     else \
         exec uvicorn main:app --host 0.0.0.0 --port 8000 --reload; \
     fi

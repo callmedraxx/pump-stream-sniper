@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Set
 
 from sqlalchemy import and_, desc, or_
@@ -15,6 +15,9 @@ from ..services.fetch_activities import fetch_creator_trades_for_mint, fetch_cre
 from ..services.event_broadcaster import broadcaster
 # TEMPORARILY DISABLED: from ..services.fetch_top_holders import TopHoldersService
 from ..services.token_service import TokenService
+from ..models.database import SessionLocal
+from ..models.database import DB_CONNECTION_SEMAPHORE
+from ..models.database import log_pool_status
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +28,11 @@ class DatabaseSyncService:
     Handles parallel processing, real-time updates, and data consistency
     """
 
-    def __init__(self, db: Session, max_workers: int = 20):
+    def __init__(self, db: Session, max_workers: int = 5):
         self.db = db
-        self.token_service = TokenService(db)
-        # TEMPORARILY DISABLED: self.holders_service = TopHoldersService(
-        #     db, max_concurrent=max_workers // 2
-        # )  # Use half the workers for holders
+        # Pass the session factory rather than a single Session instance.
+        # TokenService will open/close sessions per operation which is thread-safe.
+        self.token_service = TokenService(session_factory=SessionLocal)
         self.max_workers = max_workers
         self.executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="token_sync"
@@ -47,8 +49,6 @@ class DatabaseSyncService:
         except Exception:
             return 0.0
 
-        # If API returns a percent like 85.22 (meaning 85.22%), convert to fraction 0.8522
-        # If API returns a small number like 0.85 or -0.17, assume it's already fraction
         if abs(v) > 1 and abs(v) < 10000:
             return v / 100.0
         return v
@@ -68,6 +68,10 @@ class DatabaseSyncService:
         start_time = time.time()
 
         logger.info(f"Starting sync with {len(live_tokens_data)} tokens using {self.max_workers} workers")
+        try:
+            log_pool_status(logger, "sync_live_tokens_start")
+        except Exception:
+            pass
 
         # Extract mint addresses from live data
         live_mint_addresses = {
@@ -76,7 +80,7 @@ class DatabaseSyncService:
 
         # Get existing tokens from database
         existing_tokens = self.token_service.get_all_tokens(
-            limit=10000
+            limit=5
         )  # Get all for comparison
         existing_mint_addresses = {token.mint_address for token in existing_tokens}
 
@@ -122,14 +126,6 @@ class DatabaseSyncService:
         # Execute all tasks concurrently
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
-            # TEMPORARILY DISABLED: Update holders data for all live tokens (run in background)
-            # if live_mint_addresses:
-            #     # Don't await this - let it run in background for better performance
-            #     asyncio.create_task(
-            #         self.update_holders_for_tokens(list(live_mint_addresses))
-            #     )
-
             sync_time = time.time() - start_time
             stats = {
                 "sync_time_seconds": round(sync_time, 2),
@@ -142,34 +138,16 @@ class DatabaseSyncService:
                 ),
             }
 
-            # logger.info(
-            #     f"Sync completed in {stats['sync_time_seconds']}s - {stats['tokens_per_second']} tokens/sec"
-            # )
-
-            # Fetch and update candle data for live tokens
             try:
                 await self._update_candle_data_for_live_tokens()
             except Exception as e:
                 logger.error(f"Error updating candle data: {e}")
-
-            # Publish sync completed event so subscribers (SSE/websocket) can react immediately
-            try:
-                logger.info("DatabaseSyncService publishing sync_completed: %s", stats)
-                # publish asynchronously but don't await if no loop; safest is to schedule
-                asyncio.create_task(broadcaster.publish("sync_completed", stats))
-            except Exception:
-                # If create_task fails (no running loop), try direct publish (sync)
                 try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(broadcaster.publish("sync_completed", stats))
-                    else:
-                        # fallback: run until complete
-                        loop.run_until_complete(broadcaster.publish("sync_completed", stats))
+                    log_pool_status(logger, "after_candle_update_error")
                 except Exception:
                     pass
-
             return stats
+
 
     async def _add_new_tokens_parallel(self, new_tokens_data: List[Dict[str, Any]]):
         """Add new tokens using batch market activities fetching"""
@@ -198,6 +176,13 @@ class DatabaseSyncService:
             async with semaphore:
                 try:
                     mint_address = token_data.get("mint")
+                    
+                    # Skip tokens without valid image_url to prevent database constraint violations
+                    image_uri = token_data.get("image_uri")
+                    if not image_uri or image_uri.strip() == "":
+                        logger.warning(f"Skipping token {mint_address} - no image_url provided")
+                        return
+                    
                     market_activities = batch_activities.get(mint_address, {})
 
                     # Fetch dev/creator last activity once at creation
@@ -238,15 +223,19 @@ class DatabaseSyncService:
                             if balance_info:
                                 token_dict["creator_balance_sol"] = balance_info.get("balance")
                                 token_dict["creator_balance_usd"] = balance_info.get("balanceUSD")
-                                logger.info(
-                                    f"Initial creator balance for new token {mint_address} (creator={creator_addr}): "
-                                    f"sol={token_dict.get('creator_balance_sol')} usd={token_dict.get('creator_balance_usd')}"
-                                )
+                                # logger.info(
+                                #     f"Initial creator balance for new token {mint_address} (creator={creator_addr}): "
+                                #     f"sol={token_dict.get('creator_balance_sol')} usd={token_dict.get('creator_balance_usd')}"
+                                # )
                         except Exception as e:
                             logger.warning(f"Failed to fetch creator balance for {creator_addr}/{mint_address}: {e}")
                     
-                    # Create token in database
-                    self.token_service.create_token(token_dict)
+                    # Create token in database (offload blocking DB work to thread)
+                    try:
+                        async with DB_CONNECTION_SEMAPHORE:
+                            await asyncio.to_thread(self.token_service.create_token, token_dict)
+                    except Exception:
+                        logger.exception("Failed to create token (threaded) %s", mint_address)
                     #logger.info(f"Created token: {token_data.get('symbol')} mint={mint_address} created_coin_count={token_dict.get('created_coin_count')} creator_balance_sol={token_dict.get('creator_balance_sol')} creator_balance_usd={token_dict.get('creator_balance_usd')}")
                     
                 except Exception as e:
@@ -313,7 +302,11 @@ class DatabaseSyncService:
                     
                     # Check if any fields actually changed
                     if self._has_changes(existing_token, update_data):
-                        self.token_service.update_token(mint_address, update_data)
+                        try:
+                            async with DB_CONNECTION_SEMAPHORE:
+                                await asyncio.to_thread(self.token_service.update_token, mint_address, update_data)
+                        except Exception:
+                            logger.exception("Failed to update token (threaded) %s", mint_address)
                         logger.debug(f"Updated token: {token_data.get('symbol')}")
                     else:
                         logger.debug(f"No changes for token: {token_data.get('symbol')}")
@@ -340,26 +333,7 @@ class DatabaseSyncService:
                 .update({"is_live": False, "live_since": None}, synchronize_session=False)
             )
             self.db.commit()
-            #logger.info("Bulk marked %d tokens as inactive", updated)
             
-            # Publish bulk token_updated event for all tokens that became inactive
-            if updated > 0:
-                try:
-                    # For bulk updates, publish a single event indicating multiple tokens changed
-                    payload = {
-                        "type": "bulk_token_updated", 
-                        "data": {
-                            "mint_addresses": removed_mints,
-                            "update_type": "is_live_false",
-                            "count": updated,
-                            "updated_at": datetime.utcnow().isoformat(),
-                        },
-                    }
-                    ok = broadcaster.schedule_publish("token_updated", payload)
-                    if not ok:
-                        logger.warning("broadcaster.schedule_publish returned False for bulk is_live update (%d tokens)", updated)
-                except Exception:
-                    logger.exception("Failed to publish bulk token_updated for is_live=False updates")
         except Exception as e:
             logger.exception("Bulk update failed, falling back to per-mint updates: %s", e)
             # Fallback: update individually (slower) using token_service to preserve existing behavior
@@ -370,15 +344,15 @@ class DatabaseSyncService:
                 except Exception as ex:
                     logger.error("Error marking token %s as inactive: %s", mint, ex)
 
+
+
     async def _update_candle_data_for_live_tokens(self):
         """Fetch and update candle data for all live tokens"""
         try:
-            # Get all live tokens
             live_tokens = self.token_service.get_live_tokens()
             if not live_tokens:
                 logger.debug("No live tokens found for candle data update")
                 return
-
             logger.info(f"Updating candle data for {len(live_tokens)} live tokens")
 
             # Create candle fetch service
@@ -400,8 +374,12 @@ class DatabaseSyncService:
                     candle_data = candle_data_dict.get(mint_address)
                     if candle_data is not None:
                         # Persist even empty lists (if service returned []) or actual data
-                        self.token_service.update_token(mint_address, {"candle_data": candle_data})
-                        updated_count += 1
+                        try:
+                            async with DB_CONNECTION_SEMAPHORE:
+                                await asyncio.to_thread(self.token_service.update_token, mint_address, {"candle_data": candle_data})
+                            updated_count += 1
+                        except Exception:
+                            logger.exception("Failed to persist candle_data for %s", mint_address)
 
                 logger.info(f"Updated candle data for {updated_count}/{len(live_tokens)} live tokens")
 
@@ -411,6 +389,7 @@ class DatabaseSyncService:
         except Exception as e:
             logger.error(f"Error in candle data update: {e}")
             raise
+
 
     def _prepare_token_data(
         self, token_data: Dict[str, Any], market_activities: Dict[str, Any] = None
@@ -438,7 +417,7 @@ class DatabaseSyncService:
             "mint_address": token_data.get("mint", ""),
             "name": token_data.get("name", ""),
             "symbol": token_data.get("symbol", ""),
-            "image_url": token_data.get("image_uri", ""),
+            "image_url": token_data.get("image_uri") or "https://via.placeholder.com/150?text=No+Image",
             "stream_url": f"https://pump.fun/coin/{token_data.get('mint', '')}",
             "creator": token_data.get("creator", ""),
             "total_supply": token_data.get("total_supply", 0) or 0,
@@ -506,6 +485,8 @@ class DatabaseSyncService:
             # Raw data backup
             "raw_data": token_data,
         }
+
+
 
     def _prepare_update_data(
         self, token_data: Dict[str, Any], market_activities: Dict[str, Any] = None
@@ -618,19 +599,72 @@ class DatabaseSyncService:
 
         return False
 
-    # TEMPORARILY DISABLED: async def update_holders_for_tokens(
-    #     self, mint_addresses: List[str]
-    # ) -> Dict[str, bool]:
-    #     """
-    #     Update holders data for specified tokens
-    #     """
-    #     if not mint_addresses:
-    #         return {}
-
-    #     logger.info(f"Updating holders for {len(mint_addresses)} tokens")
-    #     return await self.holders_service.update_multiple_tokens_holders(mint_addresses)
-
     def cleanup(self):
         """Cleanup resources"""
         if self.executor:
             self.executor.shutdown(wait=True)
+
+    # async def delete_inactive_tokens_once(self, grace_seconds: int = 5) -> int:
+    #     """Delete tokens that are not live anymore.
+
+    #     This performs a safe, short-lived transaction to remove tokens where
+    #     is_live == False and which have been inactive for at least `grace_seconds`.
+    #     It uses a local session (SessionLocal) and gates access with
+    #     DB_CONNECTION_SEMAPHORE so it doesn't compete with other concurrent DB threads.
+
+    #     Returns the number of rows deleted.
+    #     """
+    #     deleted_count = 0
+    #     try:
+    #         # Acquire semaphore to avoid creating too many DB-concurrent threads
+    #         async with DB_CONNECTION_SEMAPHORE:
+    #             def _delete():
+    #                 db = SessionLocal()
+    #                 try:
+    #                     # Optional: only delete tokens that have been inactive for a short grace period
+    #                     # This prevents racing with a concurrent update that may be flipping is_live -> True
+    #                     cutoff = datetime.utcnow() - timedelta(seconds=grace_seconds)
+    #                     # Delete rows where is_live == False and (live_since is NULL or live_since < cutoff)
+    #                     q = db.query(Token).filter(
+    #                         Token.is_live == False,
+    #                         or_(Token.live_since == None, Token.live_since < cutoff),
+    #                     )
+    #                     # Count before delete
+    #                     count = q.count()
+    #                     if count > 0:
+    #                         q.delete(synchronize_session=False)
+    #                         db.commit()
+    #                     return count
+    #                 finally:
+    #                     try:
+    #                         db.close()
+    #                     except Exception:
+    #                         pass
+
+    #             # Run DB work in thread
+    #             deleted_count = await asyncio.to_thread(_delete)
+
+    #     except Exception as e:
+    #         logger.exception("Error deleting inactive tokens: %s", e)
+
+    #     if deleted_count:
+    #         logger.info("Deleted %d inactive tokens", deleted_count)
+    #     return deleted_count
+
+    async def remove_inactive_tokens_loop(self, interval_seconds: int = 5, grace_seconds: int = 5):
+        """Background loop that periodically deletes inactive tokens.
+
+        This is safe to run concurrently with the sync pipeline because it uses
+        the DB_CONNECTION_SEMAPHORE and short-lived sessions.
+        """
+        logger.info("Starting inactive-token cleanup loop (interval=%ss, grace=%ss)", interval_seconds, grace_seconds)
+        try:
+            while True:
+                try:
+                    await self.delete_inactive_tokens_once(grace_seconds=grace_seconds)
+                except Exception as e:
+                    logger.exception("Error in inactive-token cleanup pass: %s", e)
+                await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            logger.info("Inactive-token cleanup loop cancelled")
+            raise
